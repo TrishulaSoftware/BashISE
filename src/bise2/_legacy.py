@@ -1,0 +1,3038 @@
+#!/usr/bin/env python3
+import os, sys, json, stat, subprocess, tempfile, re, shlex, time
+
+# ---------------------------------------------------------------------------
+# Lightweight CLI guard: bise2 treats argv[1] as a file to open. If a user
+# passes --help/-h, it will be misinterpreted as a path. Intercept here.
+# ---------------------------------------------------------------------------
+if any(a in ('-h', '--help') for a in sys.argv[1:]):
+    print('bise2 (BashISE)')
+    print('Usage: bise2 [<path-to-open>]')
+    print('Env: BISE2_ARMORY_SELFTEST=1 python3 bise2  # run Armory bootstrap selftest')
+    sys.exit(0)
+if any(a in ('--version',) for a in sys.argv[1:]):
+    print('bise2')
+    sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# Armory Bootstrap (Hail Mary)
+# Purpose: allow Armory selftest to run BEFORE any tkinter import, so it works
+# even if GUI deps are missing/broken. This block is gated and exits immediately.
+#
+# Trigger:
+#   BISE2_ARMORY_SELFTEST=1 python3 <this_file>
+# ---------------------------------------------------------------------------
+_bise2_armory_flag = os.environ.get("BISE2_ARMORY_SELFTEST", "0").strip().lower()
+if _bise2_armory_flag in ("1", "true", "yes", "on"):
+    try:
+        import hashlib as _ah
+        import json as _aj
+        import tarfile as _at
+        import tempfile as _tmp
+        import shutil as _sh
+        import platform as _plat
+        from pathlib import Path as _p
+        from datetime import datetime as _dt, timezone as _tz
+
+        def _armory_utc_stamp_ms() -> str:
+            _now = _dt.now(_tz.utc)
+            _ms = int(_now.microsecond / 1000)
+            return _now.strftime("%Y%m%d_%H%M%S_") + f"{_ms:03d}Z"
+
+        def _armory_sha256_file(_path: "_p") -> str:
+            _h = _ah.sha256()
+            with _path.open("rb") as _f:
+                for _chunk in iter(lambda: _f.read(1024 * 1024), b""):
+                    _h.update(_chunk)
+            return _h.hexdigest()
+
+        def _armory_atomic_write_json(_path: "_p", _obj: dict) -> None:
+            _path.parent.mkdir(parents=True, exist_ok=True)
+            _fd, _tmpname = _tmp.mkstemp(prefix=_path.name + ".", suffix=".tmp", dir=str(_path.parent))
+            os.close(_fd)
+            try:
+                with open(_tmpname, "w", encoding="utf-8", newline="\n") as _wf:
+                    _aj.dump(_obj, _wf, indent=2, sort_keys=True)
+                    _wf.write("\n")
+                os.replace(_tmpname, _path)
+            finally:
+                try:
+                    if os.path.exists(_tmpname):
+                        os.remove(_tmpname)
+                except Exception:
+                    pass
+
+        def _armory_run(_cmd, _env=None, _timeout=60):
+            _t0 = _dt.now(_tz.utc)
+            try:
+                _p0 = subprocess.run(_cmd, text=True, capture_output=True, env=_env, timeout=_timeout)
+                _elapsed = int((_dt.now(_tz.utc) - _t0).total_seconds() * 1000)
+                return {
+                    "ok": (_p0.returncode == 0),
+                    "returncode": _p0.returncode,
+                    "stdout_tail": (_p0.stdout or "")[-20000:],
+                    "stderr_tail": (_p0.stderr or "")[-20000:],
+                    "elapsed_ms": _elapsed,
+                    "cmd": [str(x) for x in _cmd],
+                }
+            except Exception as _e:
+                _elapsed = int((_dt.now(_tz.utc) - _t0).total_seconds() * 1000)
+                return {
+                    "ok": False,
+                    "returncode": None,
+                    "stdout_tail": "",
+                    "stderr_tail": f"{type(_e).__name__}: {_e}",
+                    "elapsed_ms": _elapsed,
+                    "cmd": [str(x) for x in _cmd],
+                }
+
+        _stamp = _armory_utc_stamp_ms()
+        _home = _p.home()
+        _share = _home / ".local" / "share" / "bise2"
+
+        _ops = _share / "backups" / "ops" / _stamp
+        _receipts = _share / "receipts" / "armory" / _stamp
+        _packs = _share / "evidence_packs"
+        for _d in (_ops, _receipts, _packs):
+            _d.mkdir(parents=True, exist_ok=True)
+
+        _self = _p(__file__).resolve()
+        _sha = _armory_sha256_file(_self)
+        _snap = _ops / f"{_self.name}.{_sha[:12]}.bak"
+        _sh.copy2(_self, _snap)
+        import os as _os
+        _self_stat = _os.stat(str(_self))
+        _snap_stat = _os.stat(str(_snap))
+        _same_volume = (_self_stat.st_dev == _snap_stat.st_dev)
+        _bytes_self = int(_self_stat.st_size)
+        _bytes_snap = int(_snap_stat.st_size)
+        _sha_snap = _armory_sha256_file(_snap)
+        _fsync_ok = False
+        try:
+            with open(str(_snap), 'rb') as _f:
+                _os.fsync(_f.fileno())
+            _fsync_ok = True
+        except Exception:
+            _fsync_ok = False
+        _compile = _armory_run([sys.executable, "-c", "import pathlib,sys; p=sys.argv[1]; compile(pathlib.Path(p).read_text(encoding='utf-8'), p, 'exec')", str(_self)])
+        _tk = _armory_run([sys.executable, "-c", "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec(\"tkinter\") else 1)"])
+        _tk_imported = ("tkinter" in sys.modules) or ("_tkinter" in sys.modules)
+
+        _receipt = {
+            "app": "BISE2",
+            "tool": "armory_bootstrap_selftest",
+            "stamp_utc": _stamp,
+            "file": str(_self),
+            "sha256": _sha,
+            "snapshot": str(_snap),
+            "backup_method": "copy2",
+            "same_volume": bool(_same_volume),
+            "bytes_self": int(_bytes_self),
+            "bytes_backup": int(_bytes_snap),
+            "backup_sha256": str(_sha_snap),
+            "fsync_backup_ok": bool(_fsync_ok),
+            "host": {
+                "python": sys.version,
+                "platform": _plat.platform(),
+            },
+            "checks": {
+                "py_compile": _compile,
+                "tkinter_imported": bool(_tk_imported),
+                "tkinter_import": _tk,
+            },
+            "ok": bool(_compile.get("ok")) and bool(_tk.get("ok")),
+        }
+
+        _rpath = _receipts / f"op.armory_bootstrap.{_stamp}.{_sha[:12]}.json"
+        _armory_atomic_write_json(_rpath, _receipt)
+
+        _ep = _packs / f"evidence.armory_bootstrap.{_stamp}.tar.gz"
+        with _at.open(_ep, "w:gz") as _tf:
+            _tf.add(str(_receipts), arcname=f"receipts/armory/{_stamp}", recursive=True)
+            _tf.add(str(_ops), arcname=f"backups/ops/{_stamp}", recursive=True)
+
+        print("BISE2_ARMORY_SELFTEST=" + ("OK" if _receipt["ok"] else "WARN/FAIL"))
+        print("backup_snapshot:", _snap)
+        print("backup_method:", "copy2")
+        print("same_volume:", bool(_same_volume))
+        print("bytes_self:", int(_bytes_self))
+        print("bytes_backup:", int(_bytes_snap))
+        print("backup_sha256:", str(_sha_snap))
+        print("fsync_backup_ok:", bool(_fsync_ok))
+        print("op_receipt:", _rpath)
+        print("evidence_pack:", _ep)
+        print("py_compile_ok:", bool(_compile.get("ok")))
+        print("tkinter_ok:", bool(_tk.get("ok")))
+        print("tkinter_imported:", bool(_tk_imported))
+        raise SystemExit(0 if _receipt["ok"] else 1)
+    except SystemExit:
+        raise
+    except Exception as _e:
+        print("BISE2_ARMORY_SELFTEST=CRASH")
+        print(f"error: {type(_e).__name__}: {_e}")
+        raise SystemExit(2)
+
+# ---------------------------------------------------------------------------
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, simpledialog
+from tkinter import ttk
+
+APP = "BISE2"
+MAX_RECENTS = 20
+HIDE_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__"}
+
+TEMPLATE = """#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  ./SCRIPTNAME [args]
+USAGE
+}
+
+main() {
+  echo "Hello from $(basename "$0")"
+}
+
+main "$@"
+"""
+
+def have(cmd: str) -> bool:
+    from shutil import which
+    return which(cmd) is not None
+
+def run_cmd(cmd, cwd=None):
+    # BISE2 DOCTRINE: RUN_META_V1 (run_cmd capture)
+    _bise2__t0 = _bise2_time.time()
+    _bise2__started_utc = _bise2_dt.now(_bise2_tz.utc).isoformat().replace('+00:00','Z')
+    try:
+        _bise2__cmd = locals().get('cmd') or locals().get('argv') or locals().get('args')
+    except Exception:
+        _bise2__cmd = None
+    try:
+        _bise2__cwd = locals().get('cwd')
+    except Exception:
+        _bise2__cwd = None
+    try:
+        p = subprocess.run(cmd, text=True, capture_output=True, cwd=cwd)
+        try:
+            _bise2__ended_utc = _bise2_dt.now(_bise2_tz.utc).isoformat().replace('+00:00','Z')
+            _bise2__elapsed_ms = int((_bise2_time.time() - _bise2__t0) * 1000)
+            _bise2_set_run_meta(_bise2__cmd, (_bise2__cwd or _bise2_os.getcwd()), _bise2__started_utc, _bise2__ended_utc, _bise2__elapsed_ms)
+        except Exception:
+            pass
+        return p.returncode, p.stdout, p.stderr
+    except Exception as e:
+        try:
+            _bise2__ended_utc = _bise2_dt.now(_bise2_tz.utc).isoformat().replace('+00:00','Z')
+            _bise2__elapsed_ms = int((_bise2_time.time() - _bise2__t0) * 1000)
+            _bise2_set_run_meta(_bise2__cmd, (_bise2__cwd or _bise2_os.getcwd()), _bise2__started_utc, _bise2__ended_utc, _bise2__elapsed_ms)
+        except Exception:
+            pass
+        return 1, "", f"{type(e).__name__}: {e}"
+
+def atomic_write(path: str, text: str):
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path)+".", suffix=".tmp", dir=d)
+    os.close(fd)
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+
+
+# === BISE2_DOCTRINE_SAVE_BEGIN ===
+from pathlib import Path
+from datetime import datetime, timezone
+import hashlib
+
+_BISE2_SHARE = Path.home() / ".local" / "share" / "bise2"
+_BISE2_RECEIPTS = _BISE2_SHARE / "receipts"
+_BISE2_BACKUPS  = _BISE2_SHARE / "backups" / "saves"
+
+# --- BISE2 ON-WAX OPS CANON (v1) -------------------------------------------------
+# Guardrails: deny-roots, permission preflight, symlink guard (tree), trash-only delete,
+# safe rename/duplicate (files only), plans, receipts, evidence packs, session log.
+# Explicit override: set env BISE2_DANGER=1 to allow denied roots.
+
+_BISE2_PLANS    = _BISE2_SHARE / "plans"
+_BISE2_LOGS     = _BISE2_SHARE / "logs"
+_BISE2_EVIDENCE = _BISE2_SHARE / "evidence_packs"
+
+_BISE2_RECEIPT_SCHEMA = "bise2.receipt.v1"
+_BISE2_PLAN_SCHEMA    = "bise2.plan.v1"
+
+_BISE2_DENY_ROOTS = [
+    "/", "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64",
+    "/proc", "/sys", "/dev", "/run", "/boot", "/root", "/var", "/opt",
+]
+_BISE2_SESSION_LOG_PATH = None
+
+class Bise2Reason:
+    OK = "ok"
+    ZERO_DELTA = "zero_delta"
+    DENY_ROOT = "deny_root"
+    ACCESS_DENIED = "access_denied"
+    NOT_FOUND = "not_found"
+    NOT_FILE = "not_file"
+    EXISTS = "already_exists"
+    TRASH_UNAVAILABLE = "trash_unavailable"
+    DIR_NOT_SUPPORTED = "dir_not_supported"
+    ERROR = "error"
+
+_REASON_HUMAN = {
+    Bise2Reason.OK: "OK",
+    Bise2Reason.ZERO_DELTA: "No changes; zero-delta proof emitted.",
+    Bise2Reason.DENY_ROOT: "Denied root (system path). Set BISE2_DANGER=1 to override.",
+    Bise2Reason.ACCESS_DENIED: "Access denied (permission preflight failed).",
+    Bise2Reason.NOT_FOUND: "Target not found.",
+    Bise2Reason.NOT_FILE: "Target is not a file.",
+    Bise2Reason.EXISTS: "Target already exists.",
+    Bise2Reason.TRASH_UNAVAILABLE: "No trash command available (gio or trash-put).",
+    Bise2Reason.DIR_NOT_SUPPORTED: "Directory operation not supported in v1 (use future bulk/plan ops).",
+    Bise2Reason.ERROR: "Unhandled error.",
+}
+
+def _bise2_is_danger() -> bool:
+    v = os.environ.get("BISE2_DANGER", "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+def _bise2_real(p: str) -> str:
+    try:
+        return os.path.realpath(os.path.abspath(os.path.expanduser(p)))
+    except Exception:
+        return os.path.abspath(os.path.expanduser(p))
+
+def _bise2_is_denied_path(p: str) -> bool:
+    if _bise2_is_danger():
+        return False
+    rp = _bise2_real(p)
+    for root in _BISE2_DENY_ROOTS:
+        r = _bise2_real(root)
+        if r == "/":
+            if rp == "/":
+                return True
+            continue
+        if rp == r or rp.startswith(r.rstrip("/") + "/"):
+            return True
+    return False
+
+def _bise2_can_list_dir(d: str) -> bool:
+    try:
+        return os.path.isdir(d) and os.access(d, os.R_OK | os.X_OK)
+    except Exception:
+        return False
+
+def _bise2_can_write_dir(d: str) -> bool:
+    try:
+        return os.path.isdir(d) and os.access(d, os.W_OK | os.X_OK)
+    except Exception:
+        return False
+
+def _bise2_atomic_write_bytes(path: str, data: bytes, mode: int | None = None) -> None:
+    path = os.path.abspath(os.path.expanduser(path))
+    d = os.path.dirname(path)
+    base = os.path.basename(path)
+    tmp = os.path.join(d, base + f".tmp.{os.getpid()}.{int(time.time()*1000)}")
+    with open(tmp, "wb") as f:
+        f.write(data)
+        try:
+            f.flush()
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+    if mode is not None:
+        try:
+            os.chmod(tmp, mode)
+        except Exception:
+            pass
+    os.replace(tmp, path)
+
+def _bise2_stamp_utc_ms() -> str:
+    dt = datetime.now(timezone.utc)
+    return dt.strftime("%Y%m%d_%H%M%S_") + f"{dt.microsecond//1000:03d}Z"
+
+def _bise2_sha256_bytes2(b: bytes) -> str:
+    h = hashlib.sha256(); h.update(b or b""); return h.hexdigest()
+
+def _bise2_build_sha256() -> str:
+    try:
+        h = hashlib.sha256()
+        with open(__file__, "rb") as f:
+            h.update(f.read())
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+def _bise2_emit_plan(action: str, payload: dict) -> str:
+    try:
+        _BISE2_PLANS.mkdir(parents=True, exist_ok=True)
+        stamp = payload.get("stamp_utc") or _bise2_stamp_utc_ms()
+        payload["stamp_utc"] = stamp
+        payload.setdefault("schema", _BISE2_PLAN_SCHEMA)
+        payload.setdefault("action", action)
+        payload.setdefault("bise2_build_sha256", _bise2_build_sha256())
+        seed = f"{action}|{payload.get('target','')}|{stamp}|{os.getpid()}"
+        short = hashlib.sha256(seed.encode("utf-8", errors="replace")).hexdigest()[:10]
+        p = _BISE2_PLANS / f"plan.{action}.{stamp}.{short}.json"
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(p)
+        return str(p)
+    except Exception:
+        return ""
+
+def _bise2_receipt_base(action: str) -> dict:
+    return {
+        "schema": _BISE2_RECEIPT_SCHEMA,
+        "action": action,
+        "stamp_utc": _bise2_stamp_utc_ms(),
+        "ok": False,
+        "denied": False,
+        "reason_code": Bise2Reason.ERROR,
+        "reason_human": _REASON_HUMAN.get(Bise2Reason.ERROR),
+        "authority": {"human_intent": "required", "ai": "analysis_only", "execution": "tool_only"},
+        "tool_self_integrity_sha256": _bise2_build_sha256(),
+    }
+
+def _bise2_emit_receipt(action: str, payload: dict) -> str:
+    try:
+        _BISE2_RECEIPTS.mkdir(parents=True, exist_ok=True)
+        if not isinstance(payload, dict):
+            payload = {}
+        payload.setdefault("schema", _BISE2_RECEIPT_SCHEMA)
+        payload.setdefault("action", action)
+        payload.setdefault("stamp_utc", _bise2_stamp_utc_ms())
+        payload.setdefault("tool_self_integrity_sha256", _bise2_build_sha256())
+        seed = f"{action}|{payload.get('target','')}|{payload.get('stamp_utc','')}|{os.getpid()}"
+        short = hashlib.sha256(seed.encode("utf-8", errors="replace")).hexdigest()[:10]
+        p = _BISE2_RECEIPTS / f"{action}.{payload['stamp_utc']}.{short}.json"
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(p)
+        return str(p)
+    except Exception:
+        return ""
+
+def _bise2_session_init() -> str:
+    global _BISE2_SESSION_LOG_PATH
+    try:
+        _BISE2_LOGS.mkdir(parents=True, exist_ok=True)
+        stamp = _bise2_stamp_utc_ms()
+        p = _BISE2_LOGS / f"session.{stamp}.log"
+        _bise2_atomic_write_bytes(str(p), (f"[bise2] session {stamp} UTC\n").encode("utf-8"))
+        _BISE2_SESSION_LOG_PATH = str(p)
+        return str(p)
+    except Exception:
+        _BISE2_SESSION_LOG_PATH = None
+        return ""
+
+def _bise2_log(line: str) -> None:
+    try:
+        if not _BISE2_SESSION_LOG_PATH:
+            return
+        with open(_BISE2_SESSION_LOG_PATH, "a", encoding="utf-8", errors="replace") as f:
+            f.write((line.rstrip() + "\n"))
+    except Exception:
+        pass
+
+def bise2_op_write_bytes(target_path: str, new_bytes: bytes, action: str = "save", make_exec: bool = False, extra: dict | None = None) -> dict:
+    t0 = time.time()
+    target_path = os.path.abspath(os.path.expanduser(target_path))
+    parent = os.path.dirname(target_path)
+
+    base_receipt = _bise2_receipt_base(action)
+    base_receipt["target"] = target_path
+
+    # deny roots
+    if _bise2_is_denied_path(target_path) or _bise2_is_denied_path(parent):
+        base_receipt.update({
+            "ok": False,
+            "denied": True,
+            "reason_code": Bise2Reason.DENY_ROOT,
+            "reason_human": _REASON_HUMAN[Bise2Reason.DENY_ROOT],
+        })
+        rp = _bise2_emit_receipt(action, base_receipt)
+        _bise2_log(f"DENY {action} {target_path} reason=deny_root receipt={rp}")
+        return {"ok": False, "reason_code": Bise2Reason.DENY_ROOT, "receipt_path": rp, "backup_path": "", "plan_path": ""}
+
+    # permission preflight
+    if not os.path.isdir(parent):
+        base_receipt.update({"ok": False, "denied": True, "reason_code": Bise2Reason.ACCESS_DENIED, "reason_human": "Parent directory missing or not a directory."})
+        rp = _bise2_emit_receipt(action, base_receipt)
+        _bise2_log(f"DENY {action} {target_path} reason=parent_missing receipt={rp}")
+        return {"ok": False, "reason_code": Bise2Reason.ACCESS_DENIED, "receipt_path": rp, "backup_path": "", "plan_path": ""}
+    if not _bise2_can_write_dir(parent):
+        base_receipt.update({"ok": False, "denied": True, "reason_code": Bise2Reason.ACCESS_DENIED, "reason_human": _REASON_HUMAN[Bise2Reason.ACCESS_DENIED] + f" (dir: {parent})"})
+        rp = _bise2_emit_receipt(action, base_receipt)
+        _bise2_log(f"DENY {action} {target_path} reason=access_denied receipt={rp}")
+        return {"ok": False, "reason_code": Bise2Reason.ACCESS_DENIED, "receipt_path": rp, "backup_path": "", "plan_path": ""}
+
+    existed = os.path.exists(target_path)
+    if existed and (not os.path.isfile(target_path)):
+        base_receipt.update({"ok": False, "denied": True, "reason_code": Bise2Reason.NOT_FILE, "reason_human": _REASON_HUMAN[Bise2Reason.NOT_FILE]})
+        rp = _bise2_emit_receipt(action, base_receipt)
+        _bise2_log(f"DENY {action} {target_path} reason=not_file receipt={rp}")
+        return {"ok": False, "reason_code": Bise2Reason.NOT_FILE, "receipt_path": rp, "backup_path": "", "plan_path": ""}
+
+    prev_bytes = b""
+    prev_sha = ""
+    if existed:
+        try:
+            with open(target_path, "rb") as f:
+                prev_bytes = f.read()
+            prev_sha = _bise2_sha256_bytes2(prev_bytes)
+        except Exception as e:
+            base_receipt.update({"ok": False, "denied": True, "reason_code": Bise2Reason.ACCESS_DENIED, "reason_human": f"Failed to read existing file: {type(e).__name__}: {e}"})
+            rp = _bise2_emit_receipt(action, base_receipt)
+            _bise2_log(f"DENY {action} {target_path} reason=read_fail receipt={rp}")
+            return {"ok": False, "reason_code": Bise2Reason.ACCESS_DENIED, "receipt_path": rp, "backup_path": "", "plan_path": ""}
+
+    after_sha = _bise2_sha256_bytes2(new_bytes)
+
+    plan = {
+        "stamp_utc": base_receipt["stamp_utc"],
+        "target": target_path,
+        "existed_before": bool(existed),
+        "bytes_before": len(prev_bytes),
+        "bytes_after": len(new_bytes or b""),
+        "sha256_after": after_sha,
+        "make_exec": bool(make_exec),
+    }
+    if extra and isinstance(extra, dict):
+        for k,v in extra.items():
+            plan[k] = v
+    plan_path = _bise2_emit_plan(action, plan)
+
+    # zero-delta proof
+    if existed and prev_sha and prev_sha == after_sha:
+        base_receipt.update({
+            "ok": True,
+            "denied": False,
+            "reason_code": Bise2Reason.ZERO_DELTA,
+            "reason_human": _REASON_HUMAN[Bise2Reason.ZERO_DELTA],
+            "existed_before": True,
+            "backup_kind": "none",
+            "backup_path": "",
+            "before_bytes": len(prev_bytes),
+            "after_bytes": len(new_bytes or b""),
+            "before_sha256": prev_sha,
+            "after_sha256": after_sha,
+            "plan_path": plan_path,
+            "elapsed_ms": int((time.time() - t0) * 1000),
+        })
+        if extra and isinstance(extra, dict):
+            base_receipt.update(extra)
+        rp = _bise2_emit_receipt(action, base_receipt)
+        _bise2_log(f"OK {action} {target_path} zero_delta=1 receipt={rp}")
+        return {"ok": True, "zero_delta": True, "reason_code": Bise2Reason.ZERO_DELTA, "receipt_path": rp, "backup_path": "", "plan_path": plan_path}
+
+    # backup bucket (leaf + path hash)
+    _BISE2_BACKUPS.mkdir(parents=True, exist_ok=True)
+    path_hash = _bise2_sha256_bytes2(target_path.encode("utf-8", errors="replace"))[:8]
+    leaf = os.path.basename(target_path) or "file"
+    bucket = f"{leaf}.{path_hash}"
+    bdir = _BISE2_BACKUPS / bucket
+    bdir.mkdir(parents=True, exist_ok=True)
+
+    backup_path = ""
+    backup_kind = "none"
+
+    try:
+        if existed:
+            backup_kind = "before_write"
+            bak = bdir / f"before_write.{base_receipt['stamp_utc']}.{prev_sha[:8]}.bak"
+            _bise2_atomic_write_bytes(str(bak), prev_bytes)
+            backup_path = str(bak)
+
+        # choose mode
+        mode = None
+        try:
+            if existed:
+                mode = os.stat(target_path).st_mode & 0o777
+            else:
+                mode = 0o755 if (make_exec or (new_bytes or b"").startswith(b"#!") or os.path.splitext(target_path)[1] in (".sh", ".bash")) else 0o644
+        except Exception:
+            mode = None
+
+        _bise2_atomic_write_bytes(target_path, new_bytes or b"", mode=mode)
+        if make_exec:
+            try:
+                st = os.stat(target_path)
+                os.chmod(target_path, st.st_mode | 0o111)
+            except Exception:
+                pass
+
+        # init backup for create
+        if (not existed):
+            backup_kind = "create_init"
+            bak = bdir / f"create_init.{base_receipt['stamp_utc']}.{after_sha[:8]}.bak"
+            _bise2_atomic_write_bytes(str(bak), new_bytes or b"")
+            backup_path = str(bak)
+
+        elapsed_ms = int((time.time() - t0) * 1000)
+        rec = {
+            "schema": _BISE2_RECEIPT_SCHEMA,
+            "action": action,
+            "stamp_utc": base_receipt["stamp_utc"],
+            "target": target_path,
+            "ok": True,
+            "denied": False,
+            "reason_code": Bise2Reason.OK,
+            "reason_human": _REASON_HUMAN[Bise2Reason.OK],
+            "authority": base_receipt.get("authority"),
+            "tool_self_integrity_sha256": base_receipt.get("tool_self_integrity_sha256"),
+            "plan_path": plan_path,
+            "existed_before": bool(existed),
+            "backup_kind": backup_kind,
+            "backup_path": backup_path,
+            "before_bytes": len(prev_bytes),
+            "after_bytes": len(new_bytes or b""),
+            "before_sha256": prev_sha,
+            "after_sha256": after_sha,
+            "elapsed_ms": elapsed_ms,
+            "make_exec": bool(make_exec),
+        }
+        if extra and isinstance(extra, dict):
+            rec.update(extra)
+        rp = _bise2_emit_receipt(action, rec)
+        _bise2_log(f"OK {action} {target_path} receipt={rp} backup={backup_path}")
+        return {"ok": True, "receipt_path": rp, "backup_path": backup_path, "plan_path": plan_path, "reason_code": Bise2Reason.OK}
+    except Exception as e:
+        base_receipt.update({
+            "ok": False,
+            "denied": False,
+            "reason_code": Bise2Reason.ERROR,
+            "reason_human": f"{type(e).__name__}: {e}",
+            "plan_path": plan_path,
+            "backup_path": backup_path,
+            "backup_kind": backup_kind,
+        })
+        rp = _bise2_emit_receipt(action, base_receipt)
+        _bise2_log(f"ERR {action} {target_path} error={type(e).__name__} receipt={rp}")
+        return {"ok": False, "reason_code": Bise2Reason.ERROR, "receipt_path": rp, "backup_path": backup_path, "plan_path": plan_path, "error": f"{type(e).__name__}: {e}"}
+
+
+def bise2_op_write_text(target_path: str, text: str, action: str = "save", make_exec: bool = False, extra: dict | None = None) -> dict:
+    data = (text or "").encode("utf-8", errors="replace")
+    return bise2_op_write_bytes(target_path, data, action=action, make_exec=make_exec, extra=extra)
+
+
+def bise2_op_mkdir(dir_path: str) -> dict:
+    dir_path = os.path.abspath(os.path.expanduser(dir_path))
+    base = _bise2_receipt_base("mkdir")
+    base["target"] = dir_path
+
+    parent = os.path.dirname(dir_path)
+    if _bise2_is_denied_path(dir_path) or _bise2_is_denied_path(parent):
+        base.update({"ok": False, "denied": True, "reason_code": Bise2Reason.DENY_ROOT, "reason_human": _REASON_HUMAN[Bise2Reason.DENY_ROOT]})
+        rp = _bise2_emit_receipt("mkdir", base)
+        _bise2_log(f"DENY mkdir {dir_path} receipt={rp}")
+        return {"ok": False, "reason_code": Bise2Reason.DENY_ROOT, "receipt_path": rp}
+
+    if not os.path.isdir(parent) or not _bise2_can_write_dir(parent):
+        base.update({"ok": False, "denied": True, "reason_code": Bise2Reason.ACCESS_DENIED, "reason_human": _REASON_HUMAN[Bise2Reason.ACCESS_DENIED] + f" (dir: {parent})"})
+        rp = _bise2_emit_receipt("mkdir", base)
+        _bise2_log(f"DENY mkdir {dir_path} receipt={rp}")
+        return {"ok": False, "reason_code": Bise2Reason.ACCESS_DENIED, "receipt_path": rp}
+
+    plan_path = _bise2_emit_plan("mkdir", {"stamp_utc": base["stamp_utc"], "target": dir_path})
+
+    if os.path.isdir(dir_path):
+        base.update({"ok": True, "denied": False, "reason_code": Bise2Reason.ZERO_DELTA, "reason_human": _REASON_HUMAN[Bise2Reason.ZERO_DELTA], "plan_path": plan_path})
+        rp = _bise2_emit_receipt("mkdir", base)
+        _bise2_log(f"OK mkdir {dir_path} zero_delta=1 receipt={rp}")
+        return {"ok": True, "zero_delta": True, "receipt_path": rp, "plan_path": plan_path, "reason_code": Bise2Reason.ZERO_DELTA}
+
+    try:
+        os.makedirs(dir_path, exist_ok=False)
+        base.update({"ok": True, "denied": False, "reason_code": Bise2Reason.OK, "reason_human": _REASON_HUMAN[Bise2Reason.OK], "plan_path": plan_path})
+        rp = _bise2_emit_receipt("mkdir", base)
+        _bise2_log(f"OK mkdir {dir_path} receipt={rp}")
+        return {"ok": True, "receipt_path": rp, "plan_path": plan_path, "reason_code": Bise2Reason.OK}
+    except Exception as e:
+        base.update({"ok": False, "denied": False, "reason_code": Bise2Reason.ERROR, "reason_human": f"{type(e).__name__}: {e}", "plan_path": plan_path})
+        rp = _bise2_emit_receipt("mkdir", base)
+        _bise2_log(f"ERR mkdir {dir_path} receipt={rp}")
+        return {"ok": False, "receipt_path": rp, "plan_path": plan_path, "reason_code": Bise2Reason.ERROR, "error": f"{type(e).__name__}: {e}"}
+
+
+def bise2_op_delete_to_trash(target_path: str) -> dict:
+    target_path = os.path.abspath(os.path.expanduser(target_path))
+    base = _bise2_receipt_base("delete_to_trash")
+    base["target"] = target_path
+
+    if _bise2_is_denied_path(target_path):
+        base.update({"ok": False, "denied": True, "reason_code": Bise2Reason.DENY_ROOT, "reason_human": _REASON_HUMAN[Bise2Reason.DENY_ROOT]})
+        rp = _bise2_emit_receipt("delete_to_trash", base)
+        _bise2_log(f"DENY delete_to_trash {target_path} receipt={rp}")
+        return {"ok": False, "reason_code": Bise2Reason.DENY_ROOT, "receipt_path": rp}
+
+    if not os.path.exists(target_path):
+        base.update({"ok": False, "denied": True, "reason_code": Bise2Reason.NOT_FOUND, "reason_human": _REASON_HUMAN[Bise2Reason.NOT_FOUND]})
+        rp = _bise2_emit_receipt("delete_to_trash", base)
+        _bise2_log(f"DENY delete_to_trash {target_path} not_found receipt={rp}")
+        return {"ok": False, "reason_code": Bise2Reason.NOT_FOUND, "receipt_path": rp}
+
+    plan_path = _bise2_emit_plan("delete_to_trash", {"stamp_utc": base["stamp_utc"], "target": target_path})
+
+    ok, msg = trash_path(target_path)
+    if (not ok) and ("No trash command found" in (msg or "")):
+        base.update({"ok": False, "denied": True, "reason_code": Bise2Reason.TRASH_UNAVAILABLE, "reason_human": msg, "plan_path": plan_path})
+    else:
+        base.update({"ok": bool(ok), "denied": False, "reason_code": (Bise2Reason.OK if ok else Bise2Reason.ERROR), "reason_human": ("OK" if ok else msg), "plan_path": plan_path, "trash_tool": ("gio" if have("gio") else ("trash-put" if have("trash-put") else "")), "trash_msg": msg})
+
+    rp = _bise2_emit_receipt("delete_to_trash", base)
+    _bise2_log(f"{'OK' if ok else 'ERR'} delete_to_trash {target_path} receipt={rp} msg={msg}")
+    return {"ok": bool(ok), "receipt_path": rp, "plan_path": plan_path, "reason_code": base.get("reason_code"), "message": msg}
+
+
+def bise2_op_rename_file(src_path: str, dst_path: str) -> dict:
+    src_path = os.path.abspath(os.path.expanduser(src_path))
+    dst_path = os.path.abspath(os.path.expanduser(dst_path))
+    base = _bise2_receipt_base("rename")
+    base.update({"source": src_path, "target": dst_path})
+
+    if _bise2_is_denied_path(src_path) or _bise2_is_denied_path(dst_path) or _bise2_is_denied_path(os.path.dirname(src_path)) or _bise2_is_denied_path(os.path.dirname(dst_path)):
+        base.update({"ok": False, "denied": True, "reason_code": Bise2Reason.DENY_ROOT, "reason_human": _REASON_HUMAN[Bise2Reason.DENY_ROOT]})
+        rp = _bise2_emit_receipt("rename", base)
+        _bise2_log(f"DENY rename {src_path} -> {dst_path} receipt={rp}")
+        return {"ok": False, "reason_code": Bise2Reason.DENY_ROOT, "receipt_path": rp}
+
+    if not os.path.exists(src_path):
+        base.update({"ok": False, "denied": True, "reason_code": Bise2Reason.NOT_FOUND, "reason_human": _REASON_HUMAN[Bise2Reason.NOT_FOUND]})
+        rp = _bise2_emit_receipt("rename", base)
+        _bise2_log(f"DENY rename {src_path} not_found receipt={rp}")
+        return {"ok": False, "reason_code": Bise2Reason.NOT_FOUND, "receipt_path": rp}
+
+    if not os.path.isfile(src_path):
+        base.update({"ok": False, "denied": True, "reason_code": Bise2Reason.DIR_NOT_SUPPORTED, "reason_human": _REASON_HUMAN[Bise2Reason.DIR_NOT_SUPPORTED]})
+        rp = _bise2_emit_receipt("rename", base)
+        _bise2_log(f"DENY rename dir {src_path} receipt={rp}")
+        return {"ok": False, "reason_code": Bise2Reason.DIR_NOT_SUPPORTED, "receipt_path": rp}
+
+    if os.path.exists(dst_path):
+        base.update({"ok": False, "denied": True, "reason_code": Bise2Reason.EXISTS, "reason_human": _REASON_HUMAN[Bise2Reason.EXISTS]})
+        rp = _bise2_emit_receipt("rename", base)
+        _bise2_log(f"DENY rename dst_exists {dst_path} receipt={rp}")
+        return {"ok": False, "reason_code": Bise2Reason.EXISTS, "receipt_path": rp}
+
+    if not _bise2_can_write_dir(os.path.dirname(src_path)) or not _bise2_can_write_dir(os.path.dirname(dst_path)):
+        base.update({"ok": False, "denied": True, "reason_code": Bise2Reason.ACCESS_DENIED, "reason_human": _REASON_HUMAN[Bise2Reason.ACCESS_DENIED]})
+        rp = _bise2_emit_receipt("rename", base)
+        _bise2_log(f"DENY rename access_denied {src_path} receipt={rp}")
+        return {"ok": False, "reason_code": Bise2Reason.ACCESS_DENIED, "receipt_path": rp}
+
+    plan_path = _bise2_emit_plan("rename", {"stamp_utc": base["stamp_utc"], "source": src_path, "target": dst_path})
+
+    # backup before rename
+    try:
+        with open(src_path, "rb") as f:
+            b = f.read()
+        sha = _bise2_sha256_bytes2(b)
+        path_hash = _bise2_sha256_bytes2(src_path.encode("utf-8", errors="replace"))[:8]
+        leaf = os.path.basename(src_path) or "file"
+        bucket = f"{leaf}.{path_hash}"
+        bdir = _BISE2_BACKUPS / bucket
+        bdir.mkdir(parents=True, exist_ok=True)
+        bak = bdir / f"before_rename.{base['stamp_utc']}.{sha[:8]}.bak"
+        _bise2_atomic_write_bytes(str(bak), b)
+        backup_path = str(bak)
+    except Exception as e:
+        base.update({"ok": False, "denied": True, "reason_code": Bise2Reason.ERROR, "reason_human": f"Backup failed: {type(e).__name__}: {e}", "plan_path": plan_path})
+        rp = _bise2_emit_receipt("rename", base)
+        _bise2_log(f"ERR rename backup_fail {src_path} receipt={rp}")
+        return {"ok": False, "reason_code": Bise2Reason.ERROR, "receipt_path": rp, "plan_path": plan_path, "error": base.get("reason_human")}
+
+    try:
+        os.rename(src_path, dst_path)
+        base.update({
+            "ok": True,
+            "denied": False,
+            "reason_code": Bise2Reason.OK,
+            "reason_human": _REASON_HUMAN[Bise2Reason.OK],
+            "plan_path": plan_path,
+            "backup_kind": "before_rename",
+            "backup_path": backup_path,
+            "before_sha256": sha,
+            "after_sha256": sha,
+        })
+        rp = _bise2_emit_receipt("rename", base)
+        _bise2_log(f"OK rename {src_path} -> {dst_path} receipt={rp} backup={backup_path}")
+        return {"ok": True, "receipt_path": rp, "plan_path": plan_path, "backup_path": backup_path, "reason_code": Bise2Reason.OK}
+    except Exception as e:
+        base.update({"ok": False, "denied": False, "reason_code": Bise2Reason.ERROR, "reason_human": f"{type(e).__name__}: {e}", "plan_path": plan_path, "backup_kind": "before_rename", "backup_path": backup_path})
+        rp = _bise2_emit_receipt("rename", base)
+        _bise2_log(f"ERR rename {src_path} -> {dst_path} receipt={rp}")
+        return {"ok": False, "receipt_path": rp, "plan_path": plan_path, "backup_path": backup_path, "reason_code": Bise2Reason.ERROR, "error": base.get("reason_human")}
+
+
+def bise2_op_duplicate_file(src_path: str, dst_path: str) -> dict:
+    src_path = os.path.abspath(os.path.expanduser(src_path))
+    dst_path = os.path.abspath(os.path.expanduser(dst_path))
+
+    if _bise2_is_denied_path(dst_path) or _bise2_is_denied_path(os.path.dirname(dst_path)):
+        rp = _bise2_emit_receipt("duplicate", {**_bise2_receipt_base("duplicate"), "source": src_path, "target": dst_path, "ok": False, "denied": True, "reason_code": Bise2Reason.DENY_ROOT, "reason_human": _REASON_HUMAN[Bise2Reason.DENY_ROOT]})
+        _bise2_log(f"DENY duplicate {src_path} -> {dst_path} receipt={rp}")
+        return {"ok": False, "reason_code": Bise2Reason.DENY_ROOT, "receipt_path": rp}
+
+    if not os.path.isfile(src_path):
+        rp = _bise2_emit_receipt("duplicate", {**_bise2_receipt_base("duplicate"), "source": src_path, "target": dst_path, "ok": False, "denied": True, "reason_code": Bise2Reason.NOT_FILE, "reason_human": _REASON_HUMAN[Bise2Reason.NOT_FILE]})
+        _bise2_log(f"DENY duplicate not_file {src_path} receipt={rp}")
+        return {"ok": False, "reason_code": Bise2Reason.NOT_FILE, "receipt_path": rp}
+
+    if os.path.exists(dst_path):
+        rp = _bise2_emit_receipt("duplicate", {**_bise2_receipt_base("duplicate"), "source": src_path, "target": dst_path, "ok": False, "denied": True, "reason_code": Bise2Reason.EXISTS, "reason_human": _REASON_HUMAN[Bise2Reason.EXISTS]})
+        _bise2_log(f"DENY duplicate dst_exists {dst_path} receipt={rp}")
+        return {"ok": False, "reason_code": Bise2Reason.EXISTS, "receipt_path": rp}
+
+    try:
+        with open(src_path, "rb") as f:
+            data = f.read()
+        sha = _bise2_sha256_bytes2(data)
+    except Exception as e:
+        rp = _bise2_emit_receipt("duplicate", {**_bise2_receipt_base("duplicate"), "source": src_path, "target": dst_path, "ok": False, "denied": False, "reason_code": Bise2Reason.ERROR, "reason_human": f"{type(e).__name__}: {e}"})
+        _bise2_log(f"ERR duplicate read_fail {src_path} receipt={rp}")
+        return {"ok": False, "reason_code": Bise2Reason.ERROR, "receipt_path": rp, "error": f"{type(e).__name__}: {e}"}
+
+    extra = {"source": src_path, "source_sha256": sha}
+    # This will create its own plan+receipt (action=duplicate) and init backup for dest.
+    return bise2_op_write_bytes(dst_path, data, action="duplicate", make_exec=False, extra=extra)
+
+
+def bise2_export_evidence_pack(max_receipts: int = 200, max_plans: int = 200) -> dict:
+    try:
+        import tarfile, platform
+        _BISE2_EVIDENCE.mkdir(parents=True, exist_ok=True)
+        stamp = _bise2_stamp_utc_ms()
+        outp = _BISE2_EVIDENCE / f"evidence.{stamp}.tar.gz"
+
+        # pick files
+        receipts = sorted(_BISE2_RECEIPTS.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:max_receipts]
+        plans = []
+        try:
+            plans = sorted(_BISE2_PLANS.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:max_plans]
+        except Exception:
+            plans = []
+
+        cfg_dir, cfg_file = config_paths()
+        cfgp = Path(cfg_file)
+
+        # write env snapshot temp
+        env = {
+            "stamp_utc": stamp,
+            "platform": platform.platform(),
+            "python": sys.version,
+            "argv": sys.argv,
+            "danger": _bise2_is_danger(),
+            "session_log": _BISE2_SESSION_LOG_PATH or "",
+        }
+        env_bytes = (json.dumps(env, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+        with tarfile.open(outp, "w:gz") as tf:
+            # env
+            import io
+            ti = tarfile.TarInfo(name=f"env.{stamp}.json")
+            ti.size = len(env_bytes)
+            tf.addfile(ti, io.BytesIO(env_bytes))
+
+            # config
+            if cfgp.exists():
+                tf.add(str(cfgp), arcname=f"config/{cfgp.name}")
+
+            # session log
+            if _BISE2_SESSION_LOG_PATH and os.path.exists(_BISE2_SESSION_LOG_PATH):
+                tf.add(_BISE2_SESSION_LOG_PATH, arcname=f"logs/{os.path.basename(_BISE2_SESSION_LOG_PATH)}")
+
+            for p in receipts:
+                tf.add(str(p), arcname=f"receipts/{p.name}")
+            for p in plans:
+                tf.add(str(p), arcname=f"plans/{p.name}")
+
+        rec = {
+            **_bise2_receipt_base("evidence_pack"),
+            "ok": True,
+            "denied": False,
+            "reason_code": Bise2Reason.OK,
+            "reason_human": _REASON_HUMAN[Bise2Reason.OK],
+            "target": str(outp),
+            "included_receipts": len(receipts),
+            "included_plans": len(plans),
+            "session_log": _BISE2_SESSION_LOG_PATH or "",
+        }
+        rp = _bise2_emit_receipt("evidence_pack", rec)
+        _bise2_log(f"OK evidence_pack {outp} receipt={rp} receipts={len(receipts)} plans={len(plans)}")
+        return {"ok": True, "evidence_path": str(outp), "receipt_path": rp}
+    except Exception as e:
+        rp = _bise2_emit_receipt("evidence_pack", {**_bise2_receipt_base("evidence_pack"), "ok": False, "denied": False, "reason_code": Bise2Reason.ERROR, "reason_human": f"{type(e).__name__}: {e}"})
+        _bise2_log(f"ERR evidence_pack error={type(e).__name__} receipt={rp}")
+        return {"ok": False, "reason_code": Bise2Reason.ERROR, "receipt_path": rp, "error": f"{type(e).__name__}: {e}"}
+
+# --- END BISE2 ON-WAX OPS CANON (v1) ---------------------------------------------
+
+
+
+
+# BISE2 DOCTRINE: RUN_RECEIPT_EMIT
+# Emits run.*.json receipts for F5 Run / Ctrl+Enter Run Sel (saved/buffer/selection).
+from pathlib import Path as _bise2_Path
+from datetime import datetime as _bise2_dt, timezone as _bise2_tz
+import hashlib as _bise2_hashlib
+
+def _bise2_run_stamp():
+    d = _bise2_dt.now(_bise2_tz.utc)
+    return d.strftime("%Y%m%d_%H%M%S_") + f"{int(d.microsecond/1000):03d}Z"
+
+def _bise2_tail(s, n=4000):
+    if s is None: return ""
+    s = str(s)
+    return s[-n:] if len(s) > n else s
+
+def _bise2_sha256_text(s):
+    h = _bise2_hashlib.sha256()
+    h.update((s or "").encode("utf-8", errors="replace"))
+    return h.hexdigest()
+
+def _bise2_build_sha():
+    try:
+        h = _bise2_hashlib.sha256()
+        with open(__file__, "rb") as f:
+            h.update(f.read())
+        return h.hexdigest()
+    except Exception:
+        return None
+
+def emit_run_receipt(payload: dict) -> str:
+    try:
+        share = _bise2_Path.home() / ".local" / "share" / "bise2"
+        rdir = share / "receipts"
+        rdir.mkdir(parents=True, exist_ok=True)
+
+        stamp = payload.get("stamp_utc") or _bise2_run_stamp()
+        payload["stamp_utc"] = stamp
+        payload.setdefault("action", "run")
+        payload.setdefault("bise2_build_sha256", _bise2_build_sha())
+
+        seed = f"{payload.get('target','')}|{payload.get('mode','')}|{payload.get('exit_code','')}|{stamp}"
+        short = _bise2_hashlib.sha256(seed.encode("utf-8", errors="replace")).hexdigest()[:10]
+
+        p = rdir / f"run.{stamp}.{short}.json"
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(p)
+        return str(p)
+    except Exception:
+        return ""
+# END BISE2 DOCTRINE: RUN_RECEIPT_EMIT
+
+# BISE2 DOCTRINE: RUN_META_V1
+# Captures command/cwd/timing in run_cmd() and auto-merges into emit_run_receipt().
+import os as _bise2_os
+import time as _bise2_time
+from datetime import datetime as _bise2_dt, timezone as _bise2_tz
+
+_bise2_last_run_meta = {}
+
+def _bise2_set_run_meta(cmd, cwd, started_utc, ended_utc, elapsed_ms):
+    global _bise2_last_run_meta
+    try:
+        if cmd is None:
+            cmdv = []
+        elif isinstance(cmd, (list, tuple)):
+            cmdv = [str(x) for x in cmd]
+        else:
+            cmdv = [str(cmd)]
+        _bise2_last_run_meta = {
+            "cwd": str(cwd or ""),
+            "command": cmdv,
+            "started_utc": started_utc,
+            "ended_utc": ended_utc,
+            "elapsed_ms": elapsed_ms,
+        }
+    except Exception:
+        _bise2_last_run_meta = {}
+
+def _bise2_get_run_meta():
+    try:
+        return _bise2_last_run_meta if isinstance(_bise2_last_run_meta, dict) else {}
+    except Exception:
+        return {}
+
+try:
+    _bise2_emit_run_receipt_orig = emit_run_receipt
+    def emit_run_receipt(payload: dict):
+        try:
+            meta = _bise2_get_run_meta()
+            if isinstance(payload, dict) and meta:
+                payload.setdefault("cwd", meta.get("cwd"))
+                payload.setdefault("command", meta.get("command"))
+                payload.setdefault("started_utc", meta.get("started_utc"))
+                payload.setdefault("ended_utc", meta.get("ended_utc"))
+                payload.setdefault("elapsed_ms", meta.get("elapsed_ms"))
+        except Exception:
+            pass
+        return _bise2_emit_run_receipt_orig(payload)
+except Exception:
+    pass
+# END BISE2 DOCTRINE: RUN_META_V1
+
+
+def _bise2_utc_stamp():
+    dt = datetime.now(timezone.utc)
+    return dt.strftime("%Y%m%d_%H%M%S_") + f"{dt.microsecond//1000:03d}Z"
+
+def _bise2_sha256_bytes(b: bytes) -> str:
+    h = hashlib.sha256(); h.update(b); return h.hexdigest()
+
+def _bise2_ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+def doctrine_save_bytes(target_path: str, new_bytes: bytes) -> dict:
+    """Atomic save + always-backup + receipt JSON. Returns dict with backup_path/receipt_path."""
+    t0 = time.time()
+    p = Path(target_path).expanduser().resolve()
+
+    _bise2_ensure_dir(_BISE2_BACKUPS)
+    _bise2_ensure_dir(_BISE2_RECEIPTS)
+
+    # Bucket by leaf + short hash of full path (avoids collisions across dirs)
+    path_hash = _bise2_sha256_bytes(str(p).encode("utf-8"))[:8]
+    leaf = p.name or "file"
+    bucket = f"{leaf}.{path_hash}"
+    bdir = _BISE2_BACKUPS / bucket
+    _bise2_ensure_dir(bdir)
+
+    existed = p.exists()
+    prev_bytes = b""
+    prev_sha = ""
+    backup_path = None
+
+    if existed:
+        prev_bytes = p.read_bytes()
+        prev_sha = _bise2_sha256_bytes(prev_bytes)
+        stamp = _bise2_utc_stamp()
+        backup_path = bdir / f"save.{stamp}.{prev_sha[:8]}.bak"
+        backup_path.write_bytes(prev_bytes)
+
+    # Preserve mode where possible; otherwise, make scripts executable if they look like scripts.
+    mode = None
+    try:
+        if existed:
+            mode = p.stat().st_mode & 0o777
+        else:
+            mode = 0o755 if new_bytes.startswith(b"#!") or p.suffix in (".sh", ".bash") else 0o644
+    except Exception:
+        mode = None
+
+    # Atomic write (same dir temp -> replace)
+    tmp = p.with_name(p.name + f".tmp.{os.getpid()}.{int(time.time()*1000)}")
+    tmp.write_bytes(new_bytes)
+    if mode is not None:
+        try: os.chmod(tmp, mode)
+        except Exception: pass
+    os.replace(tmp, p)
+
+    new_sha = _bise2_sha256_bytes(new_bytes)
+
+    # For brand-new files, create an init backup of the created content (doctrine: always a backup).
+    if (not existed) and backup_path is None:
+        stamp = _bise2_utc_stamp()
+        backup_path = bdir / f"create.init.{stamp}.{new_sha[:8]}.bak"
+        backup_path.write_bytes(new_bytes)
+
+    elapsed_ms = int((time.time() - t0) * 1000)
+
+    receipt = {
+        "tsUtc": datetime.now(timezone.utc).isoformat(),
+        "action": "save",
+        "path": str(p),
+        "existedBefore": bool(existed),
+        "backupPath": str(backup_path) if backup_path else "",
+        "bytesBefore": len(prev_bytes),
+        "bytesAfter": len(new_bytes),
+        "sha256Before": prev_sha,
+        "sha256After": new_sha,
+        "elapsedMs": elapsed_ms,
+    }
+    receipt = _bise2__ensure_save_backup(receipt)
+
+
+    receipt_name = f"save.{_bise2_utc_stamp()}.{new_sha[:8]}.json"
+    receipt_path = _BISE2_RECEIPTS / receipt_name
+    receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    return {
+        "backup_path": str(backup_path) if backup_path else "",
+        "receipt_path": str(receipt_path),
+        "existed_before": bool(existed),
+        "sha256_before": prev_sha,
+        "sha256_after": new_sha,
+        "elapsed_ms": elapsed_ms,
+    }
+# === BISE2_DOCTRINE_SAVE_END ===
+
+def make_executable(path: str):
+    try:
+        st = os.stat(path)
+        os.chmod(path, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    except Exception:
+        pass
+
+
+# --- Doctrine Save (atomic + backup + receipt JSON) ---
+def doctrine_save(path: str, text: str, make_exec: bool = False):
+    """Canonical wrapper: atomic write + backup on every mutation + receipt JSON + guards.
+    Returns (backup_path, receipt_path)."""
+    res = bise2_op_write_text(path, text, action="save", make_exec=bool(make_exec))
+    return (res.get("backup_path", "") or ""), (res.get("receipt_path", "") or "")
+
+def config_paths():
+    cfg_dir = os.path.join(os.path.expanduser("~"), ".config", "bise2")
+    os.makedirs(cfg_dir, exist_ok=True)
+    return cfg_dir, os.path.join(cfg_dir, "recent.json")
+
+def load_recents():
+    _, p = config_paths()
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            out = []
+            for x in data:
+                if isinstance(x, str) and x and os.path.exists(x):
+                    out.append(x)
+            return out[:MAX_RECENTS]
+    except Exception:
+        pass
+    return []
+
+def save_recents(items):
+    _, p = config_paths()
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(items[:MAX_RECENTS], f, indent=2)
+    except Exception:
+        pass
+
+def open_file_manager(path: str):
+    try:
+        if os.path.isfile(path):
+            path = os.path.dirname(path)
+        subprocess.Popen(["xdg-open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+def open_terminal_here(dirpath: str) -> bool:
+    dirpath = os.path.abspath(dirpath)
+    try:
+        if have("gnome-terminal"):
+            subprocess.Popen(["gnome-terminal", "--working-directory", dirpath])
+            return True
+        if have("konsole"):
+            subprocess.Popen(["konsole", "--workdir", dirpath])
+            return True
+        if have("xfce4-terminal"):
+            subprocess.Popen(["xfce4-terminal", "--working-directory", dirpath])
+            return True
+        if have("x-terminal-emulator"):
+            subprocess.Popen(["x-terminal-emulator", "-e", "bash", "-lc", f'cd "{dirpath}"; exec bash'])
+            return True
+        if have("xterm"):
+            subprocess.Popen(["xterm", "-e", "bash", "-lc", f'cd "{dirpath}"; exec bash'])
+            return True
+    except Exception:
+        return False
+    return False
+
+def trash_path(path: str) -> (bool, str):
+    try:
+        if have("gio"):
+            rc, so, se = run_cmd(["gio", "trash", path])
+            return (rc == 0), (se.strip() or so.strip() or f"gio exit {rc}")
+        if have("trash-put"):
+            rc, so, se = run_cmd(["trash-put", path])
+            return (rc == 0), (se.strip() or so.strip() or f"trash-put exit {rc}")
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+    return False, "No trash command found (install: gio or trash-cli). Refusing to delete permanently."
+
+def parse_shellcheck_gcc(output: str):
+    # gcc format: file:line:col: severity: message [SCxxxx]
+    probs = []
+    for line in output.splitlines():
+        m = re.match(r"^(.*?):(\d+):(\d+):\s*(\w+):\s*(.*)$", line)
+        if not m:
+            continue
+        _, ln, col, sev, msg = m.groups()
+        probs.append({"tool":"shellcheck","line":int(ln),"col":int(col),"sev":sev.lower(),"msg":msg.strip()})
+    return probs
+
+def parse_bash_n(stderr: str):
+    # common: file: line N: message
+    probs = []
+    for line in stderr.splitlines():
+        m = re.search(r":\s*line\s+(\d+):\s*(.*)$", line)
+        if not m:
+            continue
+        ln, msg = m.groups()
+        probs.append({"tool":"bash -n","line":int(ln),"col":1,"sev":"error","msg":msg.strip()})
+    return probs
+
+class Bise2(tk.Tk):
+    def __init__(self, initial_file=None):
+        super().__init__()
+        self.title(APP)
+        self.geometry("1400x850")
+
+        self.filepath = None
+        self.dirty = False
+        self.last_exit = ""
+        self.recents = load_recents()
+        self.root_dir = os.getcwd()
+        self.run_mode = tk.StringVar(value="buffer")  # buffer | saved
+        self.args_var = tk.StringVar(value="")
+        self.problems = []
+
+        self._build_ui()
+        self._wire_keys()
+
+        if initial_file:
+            self.load_file(os.path.abspath(initial_file))
+        else:
+            self.editor.insert("1.0", TEMPLATE.replace("SCRIPTNAME", "script.sh"))
+            self.dirty = True
+            self.update_title()
+            self.update_status()
+            self.set_output(f"[{APP}] Ready. Ctrl+N New, Ctrl+O Open, Ctrl+S Save, F5 Run, F6 Check.\n")
+
+        self.set_root_dir(self._best_root_dir())
+
+
+    def _build_ui(self):
+        bar_row = ttk.Frame(self)
+        bar_row.pack(fill="x", side="top")
+        bar, bar_inner = make_hscroll_toolbar(bar_row)
+        bar.grid(row=0, column=0, sticky="ew")
+        bar_row.grid_columnconfigure(0, weight=1)
+        tk.Button(bar_row, text="About", command=self.on_about, width=9).grid(row=0, column=1, sticky="e", padx=4, pady=4)
+        def btn(label,cmd):
+            ttk.Button(bar_inner, text=label, command=cmd).pack(side="left", padx=2, pady=2)
+
+        btn("New", self.on_new)
+        btn("Open", self.on_open)
+        btn("Save", self.on_save)
+        btn("Save As", self.on_save_as)
+        btn("Find", self.on_find_dialog)
+        btn("Quick Open", self.on_quick_open_dialog)
+        btn("Search", self.on_project_search_dialog)
+        tk.Label(bar_inner, text="  ").pack(side="left")
+        btn("Check", self.on_check)
+        btn("Run", self.on_run)
+        btn("Run Sel", self.on_run_selection)
+        tk.Label(bar_inner, text="  ").pack(side="left")
+        btn("Refresh", self.on_refresh_tree)
+        btn("Evidence", self.on_export_evidence_pack)
+        btn("New Folder", self.on_new_folder_here)
+        btn("New File", self.on_new_file_here)
+        btn("New Script", self.on_new_script_here)
+        btn("Terminal", self.on_open_terminal_here)
+
+        # About (right-aligned)
+        # About now lives in bar_row (see toolbar setup above)
+        # Run / Args bar (separate row; prevents clipping)
+        runbar = tk.Frame(self, bd=0)
+        runbar.pack(side="top", fill="x")
+
+        tk.Label(runbar, text="Run:").pack(side="left", padx=(8,2))
+        tk.Radiobutton(runbar, text="Buffer", variable=self.run_mode, value="buffer", command=self.update_status).pack(side="left")
+        tk.Radiobutton(runbar, text="Saved",  variable=self.run_mode, value="saved",  command=self.update_status).pack(side="left", padx=(0,8))
+
+        tk.Label(runbar, text="Args:").pack(side="left", padx=(8,2))
+        self.args_entry = tk.Entry(runbar, textvariable=self.args_var)
+        self.args_entry.configure(width=1)
+        self.args_entry.pack(side="left", fill="x", expand=True, padx=(0,8))
+
+        main = tk.PanedWindow(self, orient="horizontal")
+        main.pack(fill="both", expand=True)
+
+        left = tk.Frame(main, width=320)
+        right = tk.Frame(main)
+        main.add(left, minsize=300)
+        main.add(right)
+
+        top_left = tk.Frame(left)
+        top_left.pack(side="top", fill="x")
+
+        # Root header (grid so buttons never clip)
+        tk.Label(top_left, text="Root:").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        self.root_label = tk.Label(top_left, text="", anchor="w")
+        self.root_label.grid(row=0, column=1, sticky="we", padx=6, pady=4)
+        top_left.grid_columnconfigure(1, weight=1)
+
+        tk.Button(top_left, text="Set Root", command=self.on_set_root).grid(row=0, column=2, sticky="e", padx=4, pady=4)
+        tk.Button(top_left, text="Set Root (Path)", command=self.on_set_root_from_path).grid(row=0, column=3, sticky="e", padx=4, pady=4)
+        ttk.Separator(left, orient="horizontal").pack(fill="x", pady=(0,4))
+        tk.Label(left, text="Files (right-click for actions)", anchor="w").pack(fill="x", padx=6)
+
+        tree_frame = tk.Frame(left)
+        tree_frame.pack(fill="both", expand=True, padx=6, pady=(2,6))
+        self.tree = ttk.Treeview(tree_frame, show="tree")
+        self.tree.pack(side="left", fill="both", expand=True)
+        tree_scroll = tk.Scrollbar(tree_frame, command=self.tree.yview)
+        tree_scroll.pack(side="right", fill="y")
+        self.tree.config(yscrollcommand=tree_scroll.set)
+        self.tree.bind("<<TreeviewOpen>>", self.on_tree_open)
+        self.tree.bind("<Double-1>", self.on_tree_double_click)
+        self.tree.bind("<Button-3>", self.on_tree_right_click)
+
+        ttk.Separator(left, orient="horizontal").pack(fill="x", pady=(0,4))
+        tk.Label(left, text="Recents", anchor="w").pack(fill="x", padx=6)
+        rec_frame = tk.Frame(left)
+        rec_frame.pack(fill="x", padx=6, pady=(2,6))
+        self.rec_list = tk.Listbox(rec_frame, height=6)
+        self.rec_list.pack(side="left", fill="both", expand=True)
+        rec_scroll = tk.Scrollbar(rec_frame, command=self.rec_list.yview)
+        rec_scroll.pack(side="right", fill="y")
+        self.rec_list.config(yscrollcommand=rec_scroll.set)
+        self.rec_list.bind("<Double-1>", self.on_recent_double_click)
+        self._refresh_recents_ui()
+
+        pan = tk.PanedWindow(right, orient="vertical")
+        pan.pack(fill="both", expand=True)
+
+        ed_frame = tk.Frame(pan)
+        bottom = tk.Frame(pan)
+        pan.add(ed_frame, stretch="always")
+        pan.add(bottom, height=290)
+
+        self.editor = tk.Text(ed_frame, wrap="none", undo=True)
+        self.editor.pack(side="left", fill="both", expand=True)
+        ed_scroll_y = tk.Scrollbar(ed_frame, command=self.editor.yview)
+        ed_scroll_y.pack(side="right", fill="y")
+        self.editor.config(yscrollcommand=ed_scroll_y.set)
+        self.editor.bind("<<Modified>>", self.on_modified)
+
+        self.bottom_tabs = ttk.Notebook(bottom)
+        self.bottom_tabs.pack(fill="both", expand=True)
+
+        out_frame = tk.Frame(self.bottom_tabs)
+        prob_frame = tk.Frame(self.bottom_tabs)
+        self.bottom_tabs.add(out_frame, text="Output")
+        self.bottom_tabs.add(prob_frame, text="Problems")
+
+        self.output = tk.Text(out_frame, wrap="word", state="disabled")
+        self.output.pack(side="left", fill="both", expand=True)
+        out_scroll_y = tk.Scrollbar(out_frame, command=self.output.yview)
+        out_scroll_y.pack(side="right", fill="y")
+        self.output.config(yscrollcommand=out_scroll_y.set)
+
+        cols = ("tool","sev","line","col","msg")
+        self.prob = ttk.Treeview(prob_frame, columns=cols, show="headings")
+        for c in cols:
+            self.prob.heading(c, text=c.upper())
+        self.prob.column("tool", width=90, anchor="w")
+        self.prob.column("sev", width=70, anchor="w")
+        self.prob.column("line", width=60, anchor="e")
+        self.prob.column("col", width=50, anchor="e")
+        self.prob.column("msg", width=800, anchor="w")
+        self.prob.pack(side="left", fill="both", expand=True)
+        prob_scroll = tk.Scrollbar(prob_frame, command=self.prob.yview)
+        prob_scroll.pack(side="right", fill="y")
+        self.prob.config(yscrollcommand=prob_scroll.set)
+        self.prob.bind("<Double-1>", self.on_problem_double_click)
+
+        self.status = tk.Label(self, text="", anchor="w")
+        self.status.pack(side="bottom", fill="x")
+
+        self.tree_menu = tk.Menu(self, tearoff=0)
+        self.tree_menu.add_command(label="New Folder Here", command=self.on_new_folder_here)
+        self.tree_menu.add_command(label="New File Here", command=self.on_new_file_here)
+        self.tree_menu.add_command(label="New Script Here", command=self.on_new_script_here)
+        self.tree_menu.add_separator()
+        self.tree_menu.add_command(label="Rename", command=self.on_rename_selected)
+        self.tree_menu.add_command(label="Duplicate", command=self.on_duplicate_selected)
+        self.tree_menu.add_command(label="Delete to Trash", command=self.on_delete_to_trash)
+        self.tree_menu.add_separator()
+        self.tree_menu.add_command(label="Reveal in Files", command=self.on_reveal_selected)
+        self.tree_menu.add_command(label="Open Terminal Here", command=self.on_open_terminal_here)
+        self.tree_menu.add_separator()
+        self.tree_menu.add_command(label="Set Root Here", command=self.on_set_root_here)
+
+    def _wire_keys(self):
+        self.bind("<Control-s>", lambda e: self.on_save())
+        self.bind("<Control-Shift-S>", lambda e: self.on_save_as())
+        self.bind("<Control-o>", lambda e: self.on_open())
+        self.bind("<Control-n>", lambda e: self.on_new())
+        self.bind("<Control-f>", lambda e: self.on_find_dialog())
+        self.bind("<Control-p>", lambda e: self.on_quick_open_dialog())
+        # Project Search: bind_all so it works no matter which widget has focus
+        def _ps(e):
+            self.on_project_search_dialog()
+            return "break"
+        for _seq in ("<Control-Shift-F>", "<Control-Shift-f>"):
+            try:
+                self.bind_all(_seq, _ps)
+            except Exception:
+                self.bind(_seq, _ps)
+        self.bind("<F6>", lambda e: self.on_check())
+        self.bind("<F5>", lambda e: self.on_run())
+        self.bind("<Control-Return>", lambda e: self.on_run_selection())
+        self.bind("<Control-r>", lambda e: self.on_refresh_tree())
+        self.bind("<F2>", lambda e: self.on_rename_selected())
+        self.bind("<Delete>", lambda e: self.on_delete_to_trash())
+
+    def update_title(self):
+        name = self.filepath if self.filepath else "(unsaved)"
+        mark = " *" if self.dirty else ""
+        self.title(f"{APP} — {name}{mark}")
+
+    def _refresh_title(self):
+        # Back-compat: call sites expect this name
+        return self.update_title()
+
+    def update_status(self):
+        fp = self.filepath if self.filepath else "(unsaved)"
+        self.status.config(text=f"File: {fp}    Dirty: {self.dirty}    RunMode: {self.run_mode.get()}    Args: {self.args_var.get()}    LastExit: {self.last_exit}")
+
+    def set_output(self, text: str):
+        self.output.config(state="normal")
+        self.output.delete("1.0", "end")
+        self.output.insert("1.0", text)
+        self.output.config(state="disabled")
+        self.output.see("end")
+
+    def append_output(self, text: str):
+        self.output.config(state="normal")
+        self.output.insert("end", text)
+        self.output.config(state="disabled")
+        self.output.see("end")
+
+    def set_problems(self, probs):
+        self.problems = probs[:]
+        self.prob.delete(*self.prob.get_children())
+        for i, p in enumerate(self.problems):
+            self.prob.insert("", "end", iid=str(i), values=(p["tool"], p["sev"], p["line"], p["col"], p["msg"]))
+
+    def on_modified(self, _evt=None):
+        if self.editor.edit_modified():
+            self.dirty = True
+            self.editor.edit_modified(False)
+            self.update_title()
+            self.update_status()
+
+    def maybe_save(self) -> bool:
+        if not self.dirty:
+            return True
+        r = messagebox.askyesnocancel(APP, "Save changes?")
+        if r is None:
+            return False
+        if r is True:
+            return bool(self.on_save())
+        return True
+
+    def _push_recent(self, path: str):
+        path = os.path.abspath(path)
+        if path in self.recents:
+            self.recents.remove(path)
+        self.recents.insert(0, path)
+        self.recents = [p for p in self.recents if p and os.path.exists(p)][:MAX_RECENTS]
+        save_recents(self.recents)
+        self._refresh_recents_ui()
+
+
+    def add_recent(self, path: str):
+        # Back-compat alias used by older call sites (e.g., Save As)
+        # Canonical implementation is _push_recent().
+        return self._push_recent(path)
+
+    def _refresh_recents_ui(self):
+        self.rec_list.delete(0, "end")
+        for p in self.recents[:MAX_RECENTS]:
+            self.rec_list.insert("end", p)
+
+    def on_recent_double_click(self, _evt=None):
+        try:
+            idx = int(self.rec_list.curselection()[0])
+        except Exception:
+            return
+        path = self.rec_list.get(idx)
+        if path:
+            self.load_file(path)
+
+    def _best_root_dir(self):
+        if self.filepath and os.path.exists(self.filepath):
+            return os.path.dirname(self.filepath)
+        return os.getcwd()
+
+    def set_root_dir(self, root: str):
+        root = os.path.abspath(root)
+
+        # Guard: deny system roots unless explicit override.
+        if _bise2_is_denied_path(root) and not _bise2_is_danger():
+            rp = _bise2_emit_receipt(
+                "set_root",
+                {**_bise2_receipt_base("set_root"),
+                 "target": root,
+                 "ok": False,
+                 "denied": True,
+                 "reason_code": Bise2Reason.DENY_ROOT,
+                 "reason_human": _REASON_HUMAN[Bise2Reason.DENY_ROOT]}
+            )
+            self.append_output(f"[{APP}] Set Root denied (system path): {root}\n  receipt: {rp}\n")
+            root = os.path.expanduser("~")
+
+        if not _bise2_can_list_dir(root):
+            rp = _bise2_emit_receipt(
+                "set_root",
+                {**_bise2_receipt_base("set_root"),
+                 "target": root,
+                 "ok": False,
+                 "denied": True,
+                 "reason_code": Bise2Reason.ACCESS_DENIED,
+                 "reason_human": _REASON_HUMAN[Bise2Reason.ACCESS_DENIED]}
+            )
+            self.append_output(f"[{APP}] Set Root denied (access): {root}\n  receipt: {rp}\n")
+            root = os.path.expanduser("~")
+
+        self.root_dir = root
+        self.root_label.config(text=root)
+        self._build_tree_root()
+        self.update_status()
+
+    def _build_tree_root(self):
+        self.tree.delete(*self.tree.get_children())
+        root_id = self.tree.insert("", "end", text=self.root_dir, open=True, values=(self.root_dir,))
+        self.tree.insert(root_id, "end", text="(loading...)", values=("__DUMMY__",))
+        self._expand_node(root_id)
+
+
+    def _expand_node(self, node_id):
+        children = self.tree.get_children(node_id)
+        if len(children) == 1:
+            vals = self.tree.item(children[0], "values")
+            if vals and vals[0] == "__DUMMY__":
+                self.tree.delete(children[0])
+
+        node_path = self.tree.item(node_id, "values")[0]
+        try:
+            entries = sorted(
+                os.listdir(node_path),
+                key=lambda s: (not os.path.isdir(os.path.join(node_path, s)), s.lower())
+            )
+        except Exception:
+            return
+
+        for name in entries:
+            if name in HIDE_DIRS:
+                continue
+            full = os.path.join(node_path, name)
+            try:
+                # Symlink/reparse guard: don't traverse symlink dirs by default.
+                is_link = os.path.islink(full)
+                is_dir = os.path.isdir(full)
+
+                # Also block expansion into realpaths that are denied roots (unless danger mode).
+                if is_dir and (not is_link):
+                    if _bise2_is_denied_path(os.path.realpath(full)) and not _bise2_is_danger():
+                        self.tree.insert(node_id, "end", text=name, values=(full,))
+                        continue
+                    did = self.tree.insert(node_id, "end", text=name, values=(full,))
+                    self.tree.insert(did, "end", text="(loading...)", values=("__DUMMY__",))
+                else:
+                    # file OR symlink dir treated as leaf
+                    self.tree.insert(node_id, "end", text=name, values=(full,))
+            except Exception:
+                continue
+    def on_tree_open(self, _evt=None):
+        node_id = self.tree.focus()
+        if not node_id:
+            return
+        children = self.tree.get_children(node_id)
+        if len(children) == 1:
+            vals = self.tree.item(children[0], "values")
+            if vals and vals[0] == "__DUMMY__":
+                self._expand_node(node_id)
+
+    def on_tree_double_click(self, _evt=None):
+        node_id = self.tree.focus()
+        if not node_id:
+            return
+        vals = self.tree.item(node_id, "values")
+        if not vals:
+            return
+        path = vals[0]
+        if os.path.isfile(path):
+            self.load_file(path)
+        else:
+            self.tree.item(node_id, open=not self.tree.item(node_id, "open"))
+
+    def on_tree_right_click(self, event):
+        try:
+            node = self.tree.identify_row(event.y)
+            if node:
+                self.tree.selection_set(node)
+                self.tree.focus(node)
+            self.tree_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.tree_menu.grab_release()
+
+
+    def on_export_evidence_pack(self):
+        res = bise2_export_evidence_pack()
+        if res.get("ok"):
+            self.append_output(f"[{APP}] Evidence pack: {res.get('evidence_path','')}\n  receipt: {res.get('receipt_path','')}\n")
+            try:
+                open_file_manager(res.get('evidence_path',''))
+            except Exception:
+                pass
+        else:
+            messagebox.showerror(APP, f"Evidence pack failed:\n{res.get('error', res.get('reason_code',''))}\nReceipt: {res.get('receipt_path','')}")
+
+    def on_refresh_tree(self):
+        self._build_tree_root()
+
+
+    def _selected_path(self):
+        # Prefer actual selection (more reliable than focus)
+        try:
+            sel = self.tree.selection()
+            if sel:
+                vals = self.tree.item(sel[0], "values")
+                if vals:
+                    return vals[0]
+        except Exception:
+            pass
+
+        node_id = self.tree.focus()
+        if not node_id:
+            return self.root_dir
+        vals = self.tree.item(node_id, "values")
+        if not vals:
+            return self.root_dir
+        return vals[0]
+
+    def _selected_dir(self):
+        p = self._selected_path()
+        if os.path.isdir(p):
+            return p
+        parent = os.path.dirname(p)
+        return parent if os.path.isdir(parent) else self.root_dir
+
+    def on_new_folder_here(self):
+        base = self._selected_dir() or self.root_dir
+        name = simpledialog.askstring(APP, "Folder name:")
+        if not name:
+            return
+        path = os.path.join(base, name)
+        res = bise2_op_mkdir(path)
+        if res.get("ok"):
+            self.append_output(f"[{APP}] Folder OK: {path}\n  receipt: {res.get('receipt_path','')}\n")
+            self.on_refresh_tree()
+        else:
+            messagebox.showerror(APP, f"Create folder denied/failed:\n{res.get('reason_code','')}\n{res.get('error', res.get('reason_code',''))}\nReceipt: {res.get('receipt_path','')}")
+    def on_new_file_here(self):
+        base = self._selected_dir() or self.root_dir
+        name = simpledialog.askstring(APP, "File name:")
+        if not name:
+            return
+        path = os.path.join(base, name)
+        if os.path.exists(path):
+            return messagebox.showwarning(APP, "Already exists")
+        content = ""
+        backup, receipt = doctrine_save(path, content)
+        if receipt:
+            self.append_output(f"[{APP}] Created file: {path}\n  receipt: {receipt}\n")
+        else:
+            self.append_output(f"[{APP}] Created file: {path}\n")
+        self.on_refresh_tree()
+    def on_new_script_here(self):
+        base = self._selected_dir() or self.root_dir
+        name = simpledialog.askstring(APP, "Script name (.sh):")
+        if not name:
+            return
+        if not name.endswith(".sh"):
+            name += ".sh"
+        path = os.path.join(base, name)
+        if os.path.exists(path):
+            return messagebox.showwarning(APP, "Already exists")
+        content = TEMPLATE.replace("SCRIPTNAME", os.path.basename(path))
+        backup, receipt = doctrine_save(path, content, make_exec=True)
+        if receipt:
+            self.append_output(f"[{APP}] Created script: {path}\n  receipt: {receipt}\n")
+        else:
+            self.append_output(f"[{APP}] Created script: {path}\n")
+        self.on_refresh_tree()
+    def on_rename_selected(self):
+        p = self._selected_path()
+        if not p:
+            return
+        base = os.path.dirname(p)
+        old = os.path.basename(p)
+        new = simpledialog.askstring(APP, "New name:", initialvalue=old)
+        if not new or new == old:
+            return
+        dst = os.path.join(base, new)
+        res = bise2_op_rename_file(p, dst)
+        if res.get("ok"):
+            self.append_output(f"[{APP}] Renamed: {p} -> {dst}\n  receipt: {res.get('receipt_path','')}\n")
+            self.on_refresh_tree()
+        else:
+            messagebox.showerror(APP, f"Rename denied/failed:\n{res.get('reason_code','')}\n{res.get('error', res.get('reason_code',''))}\nReceipt: {res.get('receipt_path','')}")
+    def on_delete_to_trash(self):
+        p = self._selected_path()
+        if not p:
+            return
+        if not messagebox.askyesno(APP, f"Move to Trash?\n\n{p}\n\n(No permanent delete)"):
+            return
+        res = bise2_op_delete_to_trash(p)
+        if res.get("ok"):
+            self.append_output(f"[{APP}] Trashed: {p}\n  receipt: {res.get('receipt_path','')}\n")
+            self.on_refresh_tree()
+        else:
+            messagebox.showerror(APP, f"Trash denied/failed:\n{res.get('reason_code','')}\n{res.get('message', res.get('error',''))}\nReceipt: {res.get('receipt_path','')}")
+    def on_duplicate_selected(self):
+        p = self._selected_path()
+        if not p:
+            return
+        if not os.path.isfile(p):
+            messagebox.showwarning(APP, "Duplicate supports files only (v1)")
+            return
+        base = os.path.dirname(p)
+        leaf = os.path.basename(p)
+        default = leaf + ".copy"
+        new = simpledialog.askstring(APP, "Duplicate as:", initialvalue=default)
+        if not new:
+            return
+        dst = os.path.join(base, new)
+        res = bise2_op_duplicate_file(p, dst)
+        if res.get("ok"):
+            self.append_output(f"[{APP}] Duplicated: {p} -> {dst}\n  receipt: {res.get('receipt_path','')}\n")
+            self.on_refresh_tree()
+        else:
+            messagebox.showerror(APP, f"Duplicate denied/failed:\n{res.get('reason_code','')}\n{res.get('error', res.get('reason_code',''))}\nReceipt: {res.get('receipt_path','')}")
+    def on_reveal_selected(self):
+        open_file_manager(self._selected_path())
+
+    def on_open_terminal_here(self):
+        d = self._selected_dir()
+        if not open_terminal_here(d):
+            messagebox.showwarning(APP, "No supported terminal found.")
+
+    def _about_text(self) -> str:
+        """Long-form About text (sealed canon + operator guidance)."""
+        import platform
+        NL = chr(10)
+        try:
+            build_sha = _bise2_build_sha256()
+        except Exception:
+            build_sha = ""
+
+        try:
+            py = (sys.version or "").replace(NL, " ").strip()
+        except Exception:
+            py = ""
+
+        root = getattr(self, "root_dir", "") or ""
+        cur  = getattr(self, "current_file", "") or ""
+        danger = "1" if _bise2_is_danger() else "0"
+
+        deny = ", ".join(_BISE2_DENY_ROOTS)
+
+        try:
+            share = os.path.abspath(str(_BISE2_SHARE))
+        except Exception:
+            share = str(_BISE2_SHARE)
+
+        paths = {
+            "Receipts": os.path.abspath(str(_BISE2_RECEIPTS)),
+            "Plans": os.path.abspath(str(_BISE2_PLANS)),
+            "Backups": os.path.abspath(str(_BISE2_BACKUPS)),
+            "Evidence packs": os.path.abspath(str(_BISE2_EVIDENCE)),
+            "Logs": os.path.abspath(str(_BISE2_LOGS)),
+            "Config": os.path.join(os.path.expanduser("~"), ".config", "bise2", "recent.json"),
+        }
+
+        lines = []
+        lines.append("BashISE (bise2) — Bash Integrated Scripting Environment")
+        lines.append("BashISE / Bash Boy — ON WAX CANON (FINAL · SEALED)")
+        lines.append("")
+
+        lines.append("What it is")
+        lines.append("- A local-first scripting cockpit for Bash work: open/edit/save/run/check.")
+        lines.append("- Built around Bell Boy doctrine: deterministic operations with proof artifacts.")
+        lines.append("")
+
+        lines.append("Core guarantees (the Doctrine)")
+        lines.append("- Atomic saves (temp → replace).")
+        lines.append("- Backup on every mutation (no prune / no overwrite).")
+        lines.append("- Receipt JSON is the truth: every action emits a machine-parseable receipt.")
+        lines.append("- Reason codes (“why guard”): denies/failures are explicit (enum + human explanation).")
+        lines.append("- Authority boundary: AI is analysis-only; the tool performs execution; human intent is required.")
+        lines.append("")
+
+        lines.append("Safety guardrails")
+        lines.append(f"- Root deny-list (blocked unless BISE2_DANGER=1): {deny}")
+        lines.append("- Permission preflight on writes/ops (clear ACCESS_DENIED receipts).")
+        lines.append("- Symlink/reparse guard for tree scans (no traversal by default).")
+        lines.append("- Trash-only delete (no raw rm).")
+        lines.append("")
+
+        lines.append("Evidence & audit artifacts")
+        lines.append("- Plans: pre-execution intent objects for destructive ops (where applicable).")
+        lines.append("- Receipts: per-action proofs (including deny + zero-delta / no-op).")
+        lines.append("- Evidence packs: portable tar.gz bundles of receipts/plans/logs/config + hashes.")
+        lines.append("")
+
+        lines.append("Current session context")
+        lines.append(f"- Root: {root}")
+        lines.append(f"- Current file: {cur}")
+        lines.append(f"- Danger override (BISE2_DANGER): {danger}")
+        lines.append("")
+
+        lines.append("Build & environment")
+        lines.append(f"- Tool self-integrity sha256: {build_sha}")
+        lines.append(f"- Python: {py}")
+        lines.append(f"- OS: {platform.platform()}")
+        lines.append("")
+
+        lines.append("Data locations")
+        lines.append(f"- Share root: {share}")
+        for k, v in paths.items():
+            lines.append(f"- {k}: {v}")
+        lines.append("")
+
+        lines.append("Company / Signature")
+        lines.append("BashISE")
+        lines.append("Built by Cliff Finneyfrock")
+        lines.append("Founder/Lead Project Engineer")
+        lines.append("Trishula Software")
+        lines.append("trishulasoftware@gmail.com")
+        lines.append("GitHub:  TrishulaSoftware")
+        lines.append("")
+
+        return NL.join(lines)
+
+    def on_about(self):
+        about = self._about_text()
+        try:
+            parent = getattr(self, "root", None)
+            win = tk.Toplevel(parent) if parent else tk.Toplevel()
+            win.title("About BashISE")
+            if parent:
+                try:
+                    win.transient(parent)
+                except Exception:
+                    pass
+            try:
+                win.grab_set()
+            except Exception:
+                pass
+            try:
+                win.geometry("920x740")
+            except Exception:
+                pass
+
+            body = tk.Frame(win)
+            body.pack(fill="both", expand=True, padx=10, pady=10)
+
+            txt = tk.Text(body, wrap="word")
+            sb = tk.Scrollbar(body, command=txt.yview)
+            txt.configure(yscrollcommand=sb.set)
+            txt.pack(side="left", fill="both", expand=True)
+            sb.pack(side="right", fill="y")
+
+            txt.insert("1.0", about)
+            txt.configure(state="disabled")
+
+            btns = tk.Frame(win)
+            btns.pack(fill="x", padx=10, pady=(0, 10))
+
+            def _copy():
+                try:
+                    self.clipboard_clear()
+                    self.clipboard_append(about)
+                    self.update()  # keep clipboard after close on some WMs
+                except Exception:
+                    pass
+
+            tk.Button(btns, text="Copy", command=_copy).pack(side="right")
+            tk.Button(btns, text="Close", command=win.destroy).pack(side="right", padx=(0, 8))
+        except Exception:
+            # Fallback: plain message box (truncation is ok)
+            messagebox.showinfo(APP, about)
+
+    def on_set_root_here(self):
+        p = self._selected_path()
+        self.set_root_dir(p if os.path.isdir(p) else os.path.dirname(p))
+
+
+
+    def on_set_root(self):
+        # Prefer selection in the tree (folder or file -> parent folder)
+        try:
+            import os
+            pth = self._selected_path()
+            if pth:
+                pth = os.path.abspath(os.path.expanduser(pth))
+                if os.path.isfile(pth):
+                    pth = os.path.dirname(pth)
+                if os.path.isdir(pth):
+                    self.append_output(f"[{APP}] Set Root (tree): {pth}\n")
+                    self.set_root_dir(pth)
+                    return
+        except Exception:
+            pass
+
+        # Fallback: Tk picker (note: you must enter the folder, not just highlight it)
+        d = filedialog.askdirectory(title="Set Root Folder", initialdir=self.root_dir, mustexist=True)
+        if d:
+            import os
+            d = os.path.abspath(os.path.expanduser(d))
+            self.append_output(f"[{APP}] Set Root (picker): {d}\n")
+            self.set_root_dir(d)
+
+    def on_set_root_from_path(self):
+        # GUI path entry + browse button (folder picker)
+        import os
+        import tkinter as tk
+        from tkinter import filedialog, messagebox
+
+        parent = getattr(self, "root", None)
+        win = tk.Toplevel(parent) if parent else tk.Toplevel()
+        win.title("Set Root (Path)")
+        if parent:
+            try:
+                win.transient(parent)
+            except Exception:
+                pass
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+
+        tk.Label(win, text="Enter root folder path:").grid(row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(10,4))
+
+        var = tk.StringVar(value=self.root_dir if hasattr(self, "root_dir") else "")
+        ent = tk.Entry(win, textvariable=var, width=64)
+        ent.grid(row=1, column=0, columnspan=2, sticky="we", padx=10, pady=6)
+
+        def browse():
+            start = var.get().strip() or (self.root_dir if hasattr(self, "root_dir") else os.path.expanduser("~"))
+            d = filedialog.askdirectory(title="Pick root folder", initialdir=start, mustexist=True)
+            if d:
+                var.set(os.path.abspath(os.path.expanduser(d)))
+
+        # Small icon button (falls back to text if emoji rendering is ugly on the system)
+        tk.Button(win, text="📁", width=3, command=browse).grid(row=1, column=2, sticky="e", padx=(0,10), pady=6)
+
+        out = {"value": None}
+
+        def ok():
+            out["value"] = var.get().strip()
+            win.destroy()
+
+        def cancel():
+            win.destroy()
+
+        btns = tk.Frame(win)
+        btns.grid(row=2, column=0, columnspan=3, sticky="e", padx=10, pady=(0,10))
+        tk.Button(btns, text="Cancel", command=cancel).pack(side="right", padx=(6,0))
+        tk.Button(btns, text="OK", command=ok).pack(side="right")
+
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_columnconfigure(1, weight=1)
+
+        try:
+            ent.focus_set()
+            ent.selection_range(0, "end")
+        except Exception:
+            pass
+
+        win.wait_window()
+        raw = out["value"]
+        if raw is None:
+            return
+
+        d = os.path.abspath(os.path.expanduser(raw))
+        if not os.path.isdir(d):
+            messagebox.showerror("Set Root (Path)", f"Not a directory:\n{d}")
+            return
+
+        try:
+            self.append_output(f"[{APP}] Set Root (path): {d}\n")
+        except Exception:
+            pass
+        self.set_root_dir(d)
+
+    def on_new(self):
+        if not self.maybe_save():
+            return
+        self.filepath = None
+        self.editor.delete("1.0", "end")
+        self.editor.insert("1.0", TEMPLATE.replace("SCRIPTNAME", "script.sh"))
+        self.dirty = True
+        self.set_problems([])
+        self.update_title()
+        self.update_status()
+        self.set_output(f"[{APP}] New script in buffer. Use Save As to write it.\n")
+        self.bottom_tabs.select(0)
+
+    def on_open(self):
+
+        # Explorer-style OS file dialog, but enforce guardrails on selection.
+        # If a forbidden/system path is selected, we deny and re-open the dialog
+        # (so the operator stays in an "Open" flow until a safe file is chosen).
+        try:
+            from tkinter import filedialog
+            initial = getattr(self, 'root_dir', None) or os.path.expanduser('~')
+            if not os.path.isdir(initial):
+                initial = os.path.expanduser('~')
+
+            while True:
+                path = filedialog.askopenfilename(
+                    title="Open File",
+                    initialdir=initial,
+                    filetypes=[("All files", "*.*"), ("Shell scripts", "*.sh")]
+                )
+                if not path:
+                    return
+
+                # Keep the dialog anchored to the last *non-denied* directory.
+                try:
+                    cand = os.path.dirname(os.path.abspath(path)) or initial
+                    if _bise2_is_denied_path(cand) and (not _bise2_is_danger()):
+                        cand = getattr(self, 'root_dir', None) or os.path.expanduser('~')
+                    if os.path.isdir(cand):
+                        initial = cand
+                except Exception:
+                    pass
+
+                res = self.load_file(path)
+                if res is True:
+                    return
+                if res is False:
+                    # denied -> keep looping in Open flow
+                    continue
+                return
+        except Exception:
+            # Last-resort fallback: Quick Open dialog (root-scoped)
+            try:
+                self.on_quick_open_dialog()
+            except Exception:
+                pass
+
+    def load_file(self, path: str):
+        path = os.path.abspath(path)
+        if not self.maybe_save():
+            return None
+
+        # Guard: deny opening system roots unless explicit override.
+        if _bise2_is_denied_path(path) and not _bise2_is_danger():
+            rp = _bise2_emit_receipt(
+                "open_file",
+                {**_bise2_receipt_base("open_file"),
+                 "target": path,
+                 "ok": False,
+                 "denied": True,
+                 "reason_code": Bise2Reason.DENY_ROOT,
+                 "reason_human": _REASON_HUMAN[Bise2Reason.DENY_ROOT]}
+            )
+            self.append_output(f"[{APP}] Open denied (system path): {path}\n  receipt: {rp}\n")
+            messagebox.showerror(APP, f"Open denied (system path):\n{path}\n\nReceipt:\n{rp}")
+            return False
+
+        if not os.access(path, os.R_OK):
+            rp = _bise2_emit_receipt(
+                "open_file",
+                {**_bise2_receipt_base("open_file"),
+                 "target": path,
+                 "ok": False,
+                 "denied": True,
+                 "reason_code": Bise2Reason.ACCESS_DENIED,
+                 "reason_human": _REASON_HUMAN[Bise2Reason.ACCESS_DENIED]}
+            )
+            self.append_output(f"[{APP}] Open denied (read access): {path}\n  receipt: {rp}\n")
+            messagebox.showerror(APP, f"Open denied (read access):\n{path}\n\nReceipt:\n{rp}")
+            return False
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                txt = f.read()
+        except Exception as e:
+            messagebox.showerror(APP, f"Open failed:\n{type(e).__name__}: {e}")
+            return None
+        self.filepath = path
+        self.editor.delete("1.0", "end")
+        self.editor.insert("1.0", txt)
+        self.dirty = False
+        self.set_problems([])
+        self.update_title()
+        self.update_status()
+        self.set_output(f"[{APP}] Opened: {path}\n")
+        self.bottom_tabs.select(0)
+        self._push_recent(path)
+        self.set_root_dir(os.path.dirname(path))
+        return True
+
+    def on_save(self):
+        if not self.filepath:
+            return self.on_save_as()
+        text = self.editor.get("1.0", "end-1c")
+        try:
+            backup, receipt = doctrine_save(self.filepath, text)
+            self.dirty = False
+            self._refresh_title()
+            if receipt:
+                self.append_output(f"[{APP}] Saved: {self.filepath}\n  receipt: {receipt}\n")
+            else:
+                self.append_output(f"[{APP}] Saved: {self.filepath}\n")
+            # Refresh file mtime snapshot
+            try:
+                st = os.stat(self.filepath)
+                self._open_file_stat = (st.st_mtime_ns, st.st_size)
+            except Exception:
+                self._open_file_stat = None
+        except Exception as e:
+            messagebox.showerror(APP, f"Save failed:\n{type(e).__name__}: {e}")
+    def on_save_as(self):
+        path = filedialog.asksaveasfilename(initialdir=self.root_dir)
+        if not path:
+            return
+        text = self.editor.get("1.0", "end-1c")
+        try:
+            backup, receipt = doctrine_save(path, text)
+            self.filepath = path
+            self.dirty = False
+            self._refresh_title()
+            self.add_recent(path)
+            if receipt:
+                self.append_output(f"[{APP}] Saved As: {path}\n  receipt: {receipt}\n")
+            else:
+                self.append_output(f"[{APP}] Saved As: {path}\n")
+            try:
+                st = os.stat(path)
+                self._open_file_stat = (st.st_mtime_ns, st.st_size)
+            except Exception:
+                self._open_file_stat = None
+        except Exception as e:
+            messagebox.showerror(APP, f"Save As failed:\n{type(e).__name__}: {e}")
+    def _buffer_temp(self, content: str) -> str:
+        fd, tmp = tempfile.mkstemp(prefix="bise2_", suffix=".sh")
+        os.close(fd)
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(content)
+        return tmp
+
+    def _get_args_list(self):
+        s = self.args_var.get().strip()
+        if not s:
+            return []
+        try:
+            return shlex.split(s)
+        except Exception:
+            messagebox.showwarning(APP, "Could not parse Args. Use normal shell quoting.")
+            return []
+
+    def on_check(self):
+        buf = self.editor.get("1.0", "end-1c")
+        tmp = self._buffer_temp(buf)
+        probs = []
+        try:
+            out = []
+            out.append("[check] bash -n (buffer)\n----------------------\n")
+            rc, so, se = run_cmd(["bash","-n", tmp])
+            out.append(so); out.append(se); out.append(f"\n[exit] {rc}\n")
+            probs.extend(parse_bash_n(se))
+
+            if have("shellcheck"):
+                out.append("\n[check] shellcheck (buffer)\n---------------------------\n")
+                rc2, so2, se2 = run_cmd(["shellcheck", "-f", "gcc", tmp])
+                out.append(so2); out.append(se2); out.append(f"\n[exit] {rc2}\n")
+                probs.extend(parse_shellcheck_gcc(so2 + "\n" + se2))
+            else:
+                out.append("\n[warn] shellcheck not installed.\n")
+
+            self.last_exit = f"check:{rc}"
+            self.set_output("".join(out))
+            self.set_problems(probs)
+            self.update_status()
+            self.bottom_tabs.select(1 if probs else 0)
+        finally:
+            try: os.remove(tmp)
+            except Exception: pass
+
+    def on_run(self):
+        # BISE2 DOCTRINE: RUN_GUARD (v1)
+        # Block running receipt JSON as bash. Override with BISE2_RUN_GUARD=0.
+        if os.environ.get("BISE2_RUN_GUARD","1").strip() != "0":
+            try:
+                _p = (getattr(self,"filepath","") or getattr(self,"path","") or "").strip()
+                _buf = ""
+                try:
+                    _buf = self.editor.get("1.0","end-1c")
+                except Exception:
+                    _buf = ""
+                _head = (_buf or "").lstrip()[:6000]
+                _p_norm = _p.replace("\\","/")
+                _receipts_root = os.path.expanduser("~/.local/share/bise2/receipts/").replace("\\","/")
+                _in_receipts = (_p_norm.startswith(_receipts_root) if _p_norm else False)
+                _is_json_path = (_p_norm.lower().endswith(".json") if _p_norm else False)
+                _looks_receipt = _head.startswith("{") and ('"action"' in _head) and (('"stamp_utc"' in _head) or ('"bise2_build_sha256"' in _head) or ('"started_utc"' in _head))
+                if _looks_receipt and (_in_receipts or _is_json_path):
+                    _msg = "[run] blocked: buffer looks like a BISE2 receipt JSON (set BISE2_RUN_GUARD=0 to override)\n"
+                    try:
+                        self.set_output(_msg)
+                    except Exception:
+                        try: self.append_output(_msg)
+                        except Exception: pass
+                    # best-effort blocked receipt
+                    try:
+                        import hashlib as _hh, json as _jj, datetime as _dd
+                        _d = os.path.expanduser("~/.local/share/bise2/receipts")
+                        os.makedirs(_d, exist_ok=True)
+                        _stamp = _dd.datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")[:-3] + "Z"
+                        _obj = {"action":"run_blocked","stamp_utc":_stamp,"target":_p,"reason":"receipt_json"}
+                        _js = _jj.dumps(_obj, indent=2, sort_keys=True) + "\n"
+                        _h = _hh.sha256(_js.encode("utf-8")).hexdigest()[:10]
+                        _rp = os.path.join(_d, f"run_blocked.{_stamp}.{_h}.json")
+                        with open(_rp,"w",encoding="utf-8") as _f: _f.write(_js)
+                    except Exception:
+                        pass
+                    try: self.update_status()
+                    except Exception: pass
+                    try: self.bottom_tabs.select(0)
+                    except Exception: pass
+                    return
+            except Exception:
+                pass
+
+        # BISE2 DOCTRINE: RUN_GUARD_INTERNAL_ARTIFACTS
+        try:
+            fp = os.path.abspath(self.filepath) if getattr(self, 'filepath', '') else ''
+            rdir = os.path.abspath(str(_BISE2_RECEIPTS))
+            if fp and fp.startswith(rdir + os.sep):
+                self.set_output(
+                    "[run] Refusing to execute BISE2 receipt/internal artifact:\n  %s\n" % fp
+                    + "Tip: open a .sh script (or switch to Buffer mode).\n"
+                )
+                try:
+                    self.bottom_tabs.select(0)
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+        args = self._get_args_list()
+        mode = self.run_mode.get()
+
+        if mode == "saved":
+            if not self.filepath:
+                if not self.on_save_as():
+                    return
+            if self.dirty:
+                r = messagebox.askyesnocancel(APP, "Run Saved mode requires saving first.\nSave now?")
+                if r is None or r is False:
+                    return
+                if not self.on_save():
+                    return
+            # BISE2 DOCTRINE: RUN_RECEIPT_ENRICH_V1
+            import time as _bise2_time
+            from datetime import datetime as _bise2_dt, timezone as _bise2_tz
+            _bise2_run_start_utc = _bise2_dt.now(_bise2_tz.utc).isoformat().replace('+00:00','Z')
+            _bise2_t0 = _bise2_time.time()
+            _bise2_cmd = ['bash', self.filepath] + (args or [])
+            rc, so, se = run_cmd(_bise2_cmd)
+            _bise2_run_end_utc = _bise2_dt.now(_bise2_tz.utc).isoformat().replace('+00:00','Z')
+            _bise2_elapsed_ms = int((_bise2_time.time() - _bise2_t0) * 1000)
+            self.last_exit = str(rc)
+            self.set_output(f"[run] bash (saved file)\n---------------------\n{so}{se}\n[exit] {rc}\n")
+            try:
+                _tmp = locals().get('tmp')
+                _mode = locals().get('mode')
+                _args = locals().get('args')
+                rp = emit_run_receipt({
+                        'cwd': os.getcwd(),
+                        'command': (locals().get('_bise2_cmd') or (['bash', (locals().get('tmp') or (self.filepath or ''))] + (locals().get('args') or []))),
+                        'started_utc': locals().get('_bise2_run_start_utc'),
+                        'ended_utc': locals().get('_bise2_run_end_utc'),
+                        'elapsed_ms': locals().get('_bise2_elapsed_ms'),
+                    'mode': _mode,
+                    'target': (self.filepath or ''),
+                    'temp_path': (_tmp or ''),
+                    'args': (_args or []),
+                    'exit_code': rc,
+                    'stdout_len': len(so or ''),
+                    'stderr_len': len(se or ''),
+                    'stdout_sha256': _bise2_sha256_text(so or ''),
+                    'stderr_sha256': _bise2_sha256_text(se or ''),
+                    'stdout_tail': _bise2_tail(so or ''),
+                    'stderr_tail': _bise2_tail(se or ''),
+                })
+                if rp:
+                    self.append_output(f"Receipt: {rp}\n")
+            except Exception:
+                pass
+            self.update_status()
+            self.bottom_tabs.select(0)
+            return
+
+        buf = self.editor.get("1.0", "end-1c")
+        tmp = self._buffer_temp(buf)
+        try:
+            # BISE2 DOCTRINE: RUN_RECEIPT_ENRICH_V1
+            import time as _bise2_time
+            from datetime import datetime as _bise2_dt, timezone as _bise2_tz
+            _bise2_run_start_utc = _bise2_dt.now(_bise2_tz.utc).isoformat().replace('+00:00','Z')
+            _bise2_t0 = _bise2_time.time()
+            _bise2_cmd = ['bash', tmp] + (args or [])
+            rc, so, se = run_cmd(_bise2_cmd)
+            _bise2_run_end_utc = _bise2_dt.now(_bise2_tz.utc).isoformat().replace('+00:00','Z')
+            _bise2_elapsed_ms = int((_bise2_time.time() - _bise2_t0) * 1000)
+            self.last_exit = str(rc)
+            self.set_output(f"[run] bash (buffer)\n-----------------\n{so}{se}\n[exit] {rc}\n")
+            try:
+                _tmp = locals().get('tmp')
+                _mode = locals().get('mode')
+                _args = locals().get('args')
+                rp = emit_run_receipt({
+                        'cwd': os.getcwd(),
+                        'command': (locals().get('_bise2_cmd') or (['bash', (locals().get('tmp') or (self.filepath or ''))] + (locals().get('args') or []))),
+                        'started_utc': locals().get('_bise2_run_start_utc'),
+                        'ended_utc': locals().get('_bise2_run_end_utc'),
+                        'elapsed_ms': locals().get('_bise2_elapsed_ms'),
+                    'mode': _mode,
+                    'target': (self.filepath or ''),
+                    'temp_path': (_tmp or ''),
+                    'args': (_args or []),
+                    'exit_code': rc,
+                    'stdout_len': len(so or ''),
+                    'stderr_len': len(se or ''),
+                    'stdout_sha256': _bise2_sha256_text(so or ''),
+                    'stderr_sha256': _bise2_sha256_text(se or ''),
+                    'stdout_tail': _bise2_tail(so or ''),
+                    'stderr_tail': _bise2_tail(se or ''),
+                })
+                if rp:
+                    self.append_output(f"Receipt: {rp}\n")
+            except Exception:
+                pass
+            self.update_status()
+            self.bottom_tabs.select(0)
+        finally:
+            try: os.remove(tmp)
+            except Exception: pass
+
+    def on_run_selection(self):
+        # BISE2 DOCTRINE: RUN_GUARD (v1)
+        # Block running receipt JSON as bash. Override with BISE2_RUN_GUARD=0.
+        if os.environ.get("BISE2_RUN_GUARD","1").strip() != "0":
+            try:
+                _p = (getattr(self,"filepath","") or getattr(self,"path","") or "").strip()
+                _buf = ""
+                try:
+                    _buf = self.editor.get("1.0","end-1c")
+                except Exception:
+                    _buf = ""
+                _head = (_buf or "").lstrip()[:6000]
+                _p_norm = _p.replace("\\","/")
+                _receipts_root = os.path.expanduser("~/.local/share/bise2/receipts/").replace("\\","/")
+                _in_receipts = (_p_norm.startswith(_receipts_root) if _p_norm else False)
+                _is_json_path = (_p_norm.lower().endswith(".json") if _p_norm else False)
+                _looks_receipt = _head.startswith("{") and ('"action"' in _head) and (('"stamp_utc"' in _head) or ('"bise2_build_sha256"' in _head) or ('"started_utc"' in _head))
+                if _looks_receipt and (_in_receipts or _is_json_path):
+                    _msg = "[run] blocked: buffer looks like a BISE2 receipt JSON (set BISE2_RUN_GUARD=0 to override)\n"
+                    try:
+                        self.set_output(_msg)
+                    except Exception:
+                        try: self.append_output(_msg)
+                        except Exception: pass
+                    # best-effort blocked receipt
+                    try:
+                        import hashlib as _hh, json as _jj, datetime as _dd
+                        _d = os.path.expanduser("~/.local/share/bise2/receipts")
+                        os.makedirs(_d, exist_ok=True)
+                        _stamp = _dd.datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")[:-3] + "Z"
+                        _obj = {"action":"run_blocked","stamp_utc":_stamp,"target":_p,"reason":"receipt_json"}
+                        _js = _jj.dumps(_obj, indent=2, sort_keys=True) + "\n"
+                        _h = _hh.sha256(_js.encode("utf-8")).hexdigest()[:10]
+                        _rp = os.path.join(_d, f"run_blocked.{_stamp}.{_h}.json")
+                        with open(_rp,"w",encoding="utf-8") as _f: _f.write(_js)
+                    except Exception:
+                        pass
+                    try: self.update_status()
+                    except Exception: pass
+                    try: self.bottom_tabs.select(0)
+                    except Exception: pass
+                    return
+            except Exception:
+                pass
+
+        args = self._get_args_list()
+        try:
+            sel = self.editor.get("sel.first", "sel.last")
+        except tk.TclError:
+            messagebox.showinfo(APP, "No selection. Highlight text and try Run Sel again.")
+            return
+        tmp = self._buffer_temp(sel)
+        try:
+            # BISE2 DOCTRINE: RUN_RECEIPT_ENRICH_V1
+            import time as _bise2_time
+            from datetime import datetime as _bise2_dt, timezone as _bise2_tz
+            _bise2_run_start_utc = _bise2_dt.now(_bise2_tz.utc).isoformat().replace('+00:00','Z')
+            _bise2_t0 = _bise2_time.time()
+            _bise2_cmd = ['bash', tmp] + (args or [])
+            rc, so, se = run_cmd(_bise2_cmd)
+            _bise2_run_end_utc = _bise2_dt.now(_bise2_tz.utc).isoformat().replace('+00:00','Z')
+            _bise2_elapsed_ms = int((_bise2_time.time() - _bise2_t0) * 1000)
+            self.last_exit = f"sel:{rc}"
+            self.set_output(f"[run] bash (selection)\n--------------------\n{so}{se}\n[exit] {rc}\n")
+            try:
+                _tmp = locals().get('tmp')
+                _mode = locals().get('mode')
+                _args = locals().get('args')
+                rp = emit_run_receipt({
+                        'cwd': os.getcwd(),
+                        'command': (locals().get('_bise2_cmd') or (['bash', (locals().get('tmp') or (self.filepath or ''))] + (locals().get('args') or []))),
+                        'started_utc': locals().get('_bise2_run_start_utc'),
+                        'ended_utc': locals().get('_bise2_run_end_utc'),
+                        'elapsed_ms': locals().get('_bise2_elapsed_ms'),
+                    'mode': _mode,
+                    'target': (self.filepath or ''),
+                    'temp_path': (_tmp or ''),
+                    'args': (_args or []),
+                    'exit_code': rc,
+                    'stdout_len': len(so or ''),
+                    'stderr_len': len(se or ''),
+                    'stdout_sha256': _bise2_sha256_text(so or ''),
+                    'stderr_sha256': _bise2_sha256_text(se or ''),
+                    'stdout_tail': _bise2_tail(so or ''),
+                    'stderr_tail': _bise2_tail(se or ''),
+                })
+                if rp:
+                    self.append_output(f"Receipt: {rp}\n")
+            except Exception:
+                pass
+            self.update_status()
+            self.bottom_tabs.select(0)
+        finally:
+            try: os.remove(tmp)
+            except Exception: pass
+
+
+    def on_find_dialog(self):
+        import tkinter as tk
+        from tkinter import messagebox
+
+        # Reuse the dialog if it already exists
+        try:
+            if getattr(self, '_find_win', None) and self._find_win.winfo_exists():
+                self._find_win.deiconify()
+                self._find_win.lift()
+                return
+        except Exception:
+            pass
+
+        self._find_win = tk.Toplevel(self)
+        self._find_win.title('Find / Replace')
+        try:
+            self._find_win.transient(self)
+        except Exception:
+            pass
+
+        # Vars (persist last values on self)
+        if not hasattr(self, '_find_last'):
+            self._find_last = ''
+        if not hasattr(self, '_repl_last'):
+            self._repl_last = ''
+        if not hasattr(self, '_find_case_last'):
+            self._find_case_last = False
+
+        self._find_var = tk.StringVar(value=self._find_last)
+        self._repl_var = tk.StringVar(value=self._repl_last)
+        self._case_var = tk.BooleanVar(value=bool(self._find_case_last))
+
+        tk.Label(self._find_win, text='Find:').grid(row=0, column=0, sticky='e', padx=8, pady=(10,6))
+        ent_find = tk.Entry(self._find_win, textvariable=self._find_var, width=46)
+        ent_find.grid(row=0, column=1, sticky='we', padx=8, pady=(10,6))
+
+        tk.Label(self._find_win, text='Replace:').grid(row=1, column=0, sticky='e', padx=8, pady=6)
+        ent_rep = tk.Entry(self._find_win, textvariable=self._repl_var, width=46)
+        ent_rep.grid(row=1, column=1, sticky='we', padx=8, pady=6)
+
+        tk.Checkbutton(self._find_win, text='Case sensitive', variable=self._case_var).grid(row=2, column=1, sticky='w', padx=8, pady=(0,10))
+
+        btns = tk.Frame(self._find_win)
+        btns.grid(row=0, column=2, rowspan=3, sticky='ns', padx=(0,10), pady=(10,10))
+
+        tk.Button(btns, text='Find Next', width=12, command=lambda: self._find_next(backwards=False)).pack(pady=(0,6))
+        tk.Button(btns, text='Find Prev', width=12, command=lambda: self._find_next(backwards=True)).pack(pady=(0,12))
+        tk.Button(btns, text='Replace',   width=12, command=self._replace_one).pack(pady=(0,6))
+        tk.Button(btns, text='Replace All', width=12, command=self._replace_all).pack(pady=(0,12))
+        tk.Button(btns, text='Close', width=12, command=self._find_close).pack()
+
+        self._find_win.grid_columnconfigure(1, weight=1)
+
+        # Keys
+        self._find_win.bind('<Return>', lambda e: self._find_next(backwards=False))
+        self._find_win.bind('<Shift-Return>', lambda e: self._find_next(backwards=True))
+        self._find_win.bind('<Escape>', lambda e: self._find_close())
+
+        try:
+            ent_find.focus_set()
+            ent_find.selection_range(0, 'end')
+        except Exception:
+            pass
+
+    def _find_close(self):
+        try:
+            # persist last values
+            self._find_last = (self._find_var.get() or '')
+            self._repl_last = (self._repl_var.get() or '')
+            self._find_case_last = bool(self._case_var.get())
+        except Exception:
+            pass
+        try:
+            if getattr(self, '_find_win', None) and self._find_win.winfo_exists():
+                self._find_win.destroy()
+        except Exception:
+            pass
+
+    def _find_next(self, backwards=False):
+        import tkinter as tk
+        from tkinter import messagebox
+
+        q = ''
+        try:
+            q = (self._find_var.get() or '')
+        except Exception:
+            q = ''
+        q = q if q is not None else ''
+        if not q:
+            messagebox.showinfo('Find', 'Enter text to find.')
+            return
+
+        case_sensitive = False
+        try:
+            case_sensitive = bool(self._case_var.get())
+        except Exception:
+            case_sensitive = False
+
+        # Determine start position
+        try:
+            if self.editor.tag_ranges('sel'):
+                start = 'sel.first' if backwards else 'sel.last'
+            else:
+                start = self.editor.index('insert')
+        except Exception:
+            start = '1.0'
+
+        # Clear prior highlight
+        try:
+            self.editor.tag_remove('findhit', '1.0', 'end')
+            self.editor.tag_config('findhit', background='#fff2a8')
+        except Exception:
+            pass
+
+        opts = {}
+        if not case_sensitive:
+            opts['nocase'] = True
+        if backwards:
+            opts['backwards'] = True
+            stop = '1.0'
+        else:
+            stop = 'end'
+
+        idx = self.editor.search(q, start, stopindex=stop, **opts)
+
+        # Wrap search
+        if not idx:
+            idx = self.editor.search(q, 'end' if backwards else '1.0', stopindex=stop, **opts)
+
+        if not idx:
+            messagebox.showinfo('Find', 'No match found.')
+            return
+
+        end = f"{idx}+{len(q)}c"
+        try:
+            self.editor.tag_remove('sel', '1.0', 'end')
+            self.editor.tag_add('sel', idx, end)
+            self.editor.tag_add('findhit', idx, end)
+            self.editor.mark_set('insert', end if not backwards else idx)
+            self.editor.see(idx)
+            self.editor.focus_set()
+        except Exception:
+            pass
+
+    def _replace_one(self):
+        from tkinter import messagebox
+
+        q = ''
+        r = ''
+        try:
+            q = (self._find_var.get() or '')
+            r = (self._repl_var.get() or '')
+        except Exception:
+            q = ''
+            r = ''
+        if not q:
+            messagebox.showinfo('Replace', 'Enter text to find.')
+            return
+
+        # If current selection matches, replace it; otherwise find next then replace
+        try:
+            if self.editor.tag_ranges('sel'):
+                cur = self.editor.get('sel.first', 'sel.last')
+            else:
+                cur = None
+        except Exception:
+            cur = None
+
+        if cur == q:
+            try:
+                self.editor.delete('sel.first', 'sel.last')
+                self.editor.insert('insert', r)
+                self.dirty = True
+                self.update_title()
+                self.update_status()
+            except Exception as e:
+                messagebox.showerror('Replace', str(e))
+                return
+            self._find_next(backwards=False)
+            return
+
+        self._find_next(backwards=False)
+        try:
+            if self.editor.tag_ranges('sel'):
+                cur2 = self.editor.get('sel.first', 'sel.last')
+                if cur2 == q:
+                    self.editor.delete('sel.first', 'sel.last')
+                    self.editor.insert('insert', r)
+                    self.dirty = True
+                    self.update_title()
+                    self.update_status()
+                    self._find_next(backwards=False)
+        except Exception:
+            pass
+
+    def _replace_all(self):
+        from tkinter import messagebox
+
+        q = ''
+        r = ''
+        try:
+            q = (self._find_var.get() or '')
+            r = (self._repl_var.get() or '')
+        except Exception:
+            q = ''
+            r = ''
+        if not q:
+            messagebox.showinfo('Replace All', 'Enter text to find.')
+            return
+
+        case_sensitive = False
+        try:
+            case_sensitive = bool(self._case_var.get())
+        except Exception:
+            case_sensitive = False
+
+        opts = {}
+        if not case_sensitive:
+            opts['nocase'] = True
+
+        count = 0
+        start = '1.0'
+        while True:
+            idx = self.editor.search(q, start, stopindex='end', **opts)
+            if not idx:
+                break
+            end = f"{idx}+{len(q)}c"
+            try:
+                self.editor.delete(idx, end)
+                self.editor.insert(idx, r)
+            except Exception:
+                break
+            count += 1
+            start = f"{idx}+{len(r)}c"
+
+        if count > 0:
+            self.dirty = True
+            try:
+                self.update_title()
+                self.update_status()
+            except Exception:
+                pass
+        try:
+            self.append_output(f"[{APP}] ReplaceAll: {count} replacements\n")
+        except Exception:
+            pass
+        messagebox.showinfo('Replace All', f"Replaced {count} occurrence(s).")
+
+
+    def on_quick_open_dialog(self):
+        import os
+        import tkinter as tk
+        from tkinter import messagebox
+
+        root = getattr(self, 'root_dir', os.path.expanduser('~'))
+        if not os.path.isdir(root):
+            messagebox.showerror('Quick Open', 'Root is not a directory:\n{}'.format(root))
+            return
+
+        # Guard: never allow Quick Open to operate on denied/system roots unless danger override.
+        try:
+            root_abs = os.path.abspath(root)
+            if _bise2_is_denied_path(root_abs) and (not _bise2_is_danger()):
+                rp = _bise2_emit_receipt(
+                    "quick_open",
+                    {**_bise2_receipt_base("quick_open"),
+                     "root": root_abs,
+                     "ok": False,
+                     "denied": True,
+                     "reason_code": Bise2Reason.DENY_ROOT,
+                     "reason_human": _REASON_HUMAN[Bise2Reason.DENY_ROOT]}
+                )
+                messagebox.showerror('Quick Open', 'Denied root (system path):\n{}\n\nreceipt:\n{}'.format(root_abs, rp))
+                return
+        except Exception:
+            pass
+
+        # Reuse dialog if already open
+        try:
+            if getattr(self, '_qopen_win', None) and self._qopen_win.winfo_exists():
+                self._qopen_win.deiconify(); self._qopen_win.lift()
+                return
+        except Exception:
+            pass
+
+        # Cache file index per-root (so Quick Open stays snappy)
+        if (not hasattr(self, '_qopen_root')) or (getattr(self, '_qopen_root', None) != root) or (not hasattr(self, '_qopen_index')):
+            self._qopen_root = root
+            self._qopen_index = []
+            max_files = 20000
+            try:
+                hide_dirs = set(HIDE_DIRS) if 'HIDE_DIRS' in globals() else set()
+            except Exception:
+                hide_dirs = set()
+
+            def is_hidden_dir(name):
+                if name.startswith('.'): return True
+                if name in hide_dirs: return True
+                return False
+
+            try:
+                for dirpath, dirnames, filenames in os.walk(root):
+                    dirnames[:] = [d for d in dirnames if not is_hidden_dir(d)]
+                    # Symlink/reparse guard: do not traverse symlink dirs by default.
+                    try:
+                        if not _bise2_is_danger():
+                            dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
+                    except Exception:
+                        pass
+                    for fn in filenames:
+                        full = os.path.join(dirpath, fn)
+                        try:
+                            rel = os.path.relpath(full, root)
+                        except Exception:
+                            rel = full
+                        self._qopen_index.append(rel)
+                        if len(self._qopen_index) >= max_files:
+                            raise StopIteration
+            except StopIteration:
+                pass
+            except Exception:
+                pass
+
+        self._qopen_win = tk.Toplevel(self)
+        self._qopen_win.title('Quick Open  (Ctrl+P)')
+        try: self._qopen_win.transient(self)
+        except Exception: pass
+
+        tk.Label(self._qopen_win, text='Type to filter files under Root:').grid(row=0, column=0, columnspan=3, sticky='w', padx=10, pady=(10,4))
+
+        if not hasattr(self, '_qopen_var'):
+            self._qopen_var = tk.StringVar(value='')
+        ent = tk.Entry(self._qopen_win, textvariable=self._qopen_var, width=70)
+        ent.grid(row=1, column=0, columnspan=2, sticky='we', padx=10, pady=6)
+
+        tk.Label(self._qopen_win, text='Root: {}'.format(root), anchor='w').grid(row=2, column=0, columnspan=3, sticky='we', padx=10, pady=(0,6))
+
+        frame = tk.Frame(self._qopen_win)
+        frame.grid(row=3, column=0, columnspan=3, sticky='nsew', padx=10, pady=(0,10))
+
+        lb = tk.Listbox(frame, height=18)
+        sb = tk.Scrollbar(frame, orient='vertical', command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        lb.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+
+        status = tk.Label(self._qopen_win, text='', anchor='w')
+        status.grid(row=4, column=0, columnspan=3, sticky='we', padx=10, pady=(0,10))
+
+        def refresh(*_):
+            q = (self._qopen_var.get() or '').strip().lower()
+            lb.delete(0, 'end')
+            shown = 0
+            limit = 500
+            for rel in self._qopen_index:
+                if (not q) or (q in rel.lower()):
+                    lb.insert('end', rel)
+                    shown += 1
+                    if shown >= limit:
+                        break
+            status.config(text='Matches: {} (showing up to {})'.format(shown, limit))
+
+        def open_selected(*_):
+            try:
+                sel = lb.curselection()
+                if not sel: return
+                rel = lb.get(sel[0])
+                full = rel if os.path.isabs(rel) else os.path.join(root, rel)
+                full = os.path.abspath(os.path.expanduser(full))
+                if not os.path.isfile(full):
+                    messagebox.showerror('Quick Open', 'Not a file:\n{}'.format(full))
+                    return
+                self.load_file(full)
+                try: self.append_output('[{}] QuickOpen: {}\n'.format(APP, full))
+                except Exception: pass
+                try: self._qopen_win.destroy()
+                except Exception: pass
+            except Exception as e:
+                messagebox.showerror('Quick Open', str(e))
+
+        btnrow = tk.Frame(self._qopen_win)
+        btnrow.grid(row=1, column=2, sticky='e', padx=(0,10), pady=6)
+        tk.Button(btnrow, text='Open', width=8, command=open_selected).pack(side='left', padx=(0,6))
+        tk.Button(btnrow, text='Close', width=8, command=lambda: self._qopen_win.destroy()).pack(side='left')
+
+        self._qopen_win.grid_columnconfigure(0, weight=1)
+        self._qopen_win.grid_columnconfigure(1, weight=1)
+        self._qopen_win.grid_rowconfigure(3, weight=1)
+
+        ent.bind('<KeyRelease>', refresh)
+        ent.bind('<Return>', open_selected)
+        lb.bind('<Double-Button-1>', open_selected)
+        self._qopen_win.bind('<Escape>', lambda e: self._qopen_win.destroy())
+
+        refresh()
+        try: ent.focus_set(); ent.selection_range(0, 'end')
+        except Exception: pass
+
+
+    def on_project_search_dialog(self):
+        import os
+        import shutil
+        import subprocess
+        import tkinter as tk
+        from tkinter import messagebox
+
+
+
+    def on_problem_double_click(self, event=None):
+        # Safe stub: prevents startup crash if Problems panel is present but handler drifted.
+        # (We can wire real behavior later; for now, keep UI bootable.)
+        return
+
+def make_hscroll_toolbar(parent, height=34):
+    """
+    Scrollable horizontal toolbar.
+    Put buttons into returned 'inner' frame.
+    """
+    outer = ttk.Frame(parent)
+    canvas = tk.Canvas(outer, height=height, highlightthickness=0, bd=0)
+    hsb = ttk.Scrollbar(outer, orient="horizontal", command=canvas.xview)
+    canvas.configure(xscrollcommand=hsb.set)
+
+    inner = ttk.Frame(canvas)
+    canvas.create_window((0, 0), window=inner, anchor="nw")
+
+    outer.grid_columnconfigure(0, weight=1)
+    canvas.grid(row=0, column=0, sticky="ew")
+    hsb.grid(row=1, column=0, sticky="ew")
+    hsb.grid_remove()
+
+    def _recalc(_=None):
+        bbox = canvas.bbox("all")
+        if not bbox:
+            return
+        canvas.configure(scrollregion=bbox)
+        content_w = bbox[2] - bbox[0]
+        view_w = canvas.winfo_width()
+        if content_w > view_w + 2:
+            hsb.grid()
+        else:
+            hsb.grid_remove()
+            canvas.xview_moveto(0)
+
+    inner.bind("<Configure>", _recalc)
+    canvas.bind("<Configure>", _recalc)
+
+    # Shift+wheel scrolls horizontally while cursor is over toolbar
+    def _on_wheel(ev):
+        if not (ev.state & 0x0001):  # Shift
+            return
+        if getattr(ev, "delta", 0):
+            canvas.xview_scroll(int(-1 * (ev.delta / 120)), "units")
+        return "break"
+
+    def _on_b4(ev):
+        if ev.state & 0x0001:
+            canvas.xview_scroll(-3, "units")
+            return "break"
+
+    def _on_b5(ev):
+        if ev.state & 0x0001:
+            canvas.xview_scroll(3, "units")
+            return "break"
+
+    def _bind(_):
+        canvas.bind("<MouseWheel>", _on_wheel)
+        canvas.bind("<Button-4>", _on_b4)
+        canvas.bind("<Button-5>", _on_b5)
+
+    def _unbind(_):
+        canvas.unbind("<MouseWheel>")
+        canvas.unbind("<Button-4>")
+        canvas.unbind("<Button-5>")
+
+    canvas.bind("<Enter>", _bind)
+    canvas.bind("<Leave>", _unbind)
+
+    return outer, inner
+
+
+
+
+def main():
+    _bise2_session_init()
+    initial = sys.argv[1] if len(sys.argv) > 1 else None
+    app = Bise2(initial)
+    app.mainloop()
+
+
+# --- BISE2 DOCTRINE SAVE BACKUP INIT ---
+# Universal (schema-agnostic) save backup filler:
+# - Supports receipts that use target/path/file_path/etc
+# - Supports backup_path / backupPath / backup / backupFile
+# - Sets BOTH snake_case + camelCase fields when possible
+import re as _bise2_re
+import hashlib as _bise2_hashlib
+from pathlib import Path as _bise2_Path
+from datetime import datetime as _bise2_datetime, timezone as _bise2_timezone
+
+def _bise2__stamp_utc_ms():
+    _dt = _bise2_datetime.now(_bise2_timezone.utc)
+    return _dt.strftime("%Y%m%d_%H%M%S_") + f"{int(_dt.microsecond/1000):03d}Z"
+
+def _bise2__safe_name(s):
+    s = _bise2_re.sub(r"[^A-Za-z0-9._-]+", "_", str(s))
+    return (s[:120] or "file")
+
+def _bise2__first_key(receipt, keys):
+    for k in keys:
+        try:
+            v = receipt.get(k)
+        except Exception:
+            v = None
+        if isinstance(v, str):
+            if v.strip() != "":
+                return v, k
+        elif v is not None:
+            return v, k
+    return None, None
+
+def _bise2__set_if_possible(receipt, key, value):
+    try:
+        receipt[key] = value
+    except Exception:
+        pass
+
+def _bise2__ensure_save_backup(receipt):
+    # Returns (possibly modified) receipt dict.
+    try:
+        if not isinstance(receipt, dict):
+            return receipt
+
+        # action variants
+        act = receipt.get("action") or receipt.get("Action") or receipt.get("kind")
+        if act != "save":
+            return receipt
+
+        # already has a backup pointer? (any common key)
+        cur_bak, cur_bak_k = _bise2__first_key(receipt, [
+            "backup_path","backupPath","backup","backup_file","backupFile","backup_path_str","backupPathStr"
+        ])
+        if cur_bak:
+            return receipt
+
+        # find target path across schemas
+        tgt, tgt_k = _bise2__first_key(receipt, [
+            "target","path","file","file_path","filePath","filepath","full_path","fullPath"
+        ])
+        if not tgt:
+            return receipt
+
+        tgt_path = _bise2_Path(str(tgt))
+        if not tgt_path.exists():
+            return receipt
+
+        # stamp variants
+        stamp, _ = _bise2__first_key(receipt, ["stamp_utc","stampUtc","tsUtc","timestampUtc","stamp","timestamp"])
+        if not stamp or not isinstance(stamp, str):
+            stamp = _bise2__stamp_utc_ms()
+
+        # existed variants (optional)
+        existed, existed_k = _bise2__first_key(receipt, ["existed_before","existedBefore","existed","existsBefore"])
+        if isinstance(existed, str):
+            existed = existed.strip().lower() in ("1","true","yes","y")
+        elif existed is None:
+            existed = None
+        else:
+            existed = bool(existed)
+
+        share = _bise2_Path.home() / ".local" / "share" / "bise2"
+        bdir = share / "backups" / "saves"
+        bdir.mkdir(parents=True, exist_ok=True)
+
+        pathhash = _bise2_hashlib.sha256(str(tgt_path).encode("utf-8")).hexdigest()[:10]
+        sub = bdir / pathhash[:2]
+        sub.mkdir(parents=True, exist_ok=True)
+
+        base = _bise2__safe_name(tgt_path.name)
+        bak = sub / f"{base}.save.init.{stamp}.{pathhash}.bak"
+
+        data = tgt_path.read_bytes()
+        tmp = bak.with_suffix(bak.suffix + ".tmp")
+        tmp.write_bytes(data)
+        tmp.replace(bak)
+
+        # Set BOTH key styles so downstream consumers are never confused
+        _bise2__set_if_possible(receipt, "backup_path", str(bak))
+        _bise2__set_if_possible(receipt, "backupPath", str(bak))
+
+        kind = "create_init" if (existed is False) else "filled_missing_backup_path_post_save"
+        _bise2__set_if_possible(receipt, "backup_kind", kind)
+        _bise2__set_if_possible(receipt, "backupKind", kind)
+
+        return receipt
+    except Exception:
+        return receipt
+# --- END BISE2 DOCTRINE SAVE BACKUP INIT ---
+
+
+
+
+
+
+if __name__ == "__main__":
+    main()

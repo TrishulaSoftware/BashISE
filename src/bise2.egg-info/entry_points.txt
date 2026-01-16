@@ -1,0 +1,2 @@
+[console_scripts]
+bise2 = bise2.entry:main

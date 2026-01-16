@@ -1,0 +1,12 @@
+README.md
+pyproject.toml
+src/bise2/__init__.py
+src/bise2/__main__.py
+src/bise2/_legacy.py
+src/bise2/buildmeta.py
+src/bise2/entry.py
+src/bise2.egg-info/PKG-INFO
+src/bise2.egg-info/SOURCES.txt
+src/bise2.egg-info/dependency_links.txt
+src/bise2.egg-info/entry_points.txt
+src/bise2.egg-info/top_level.txt
