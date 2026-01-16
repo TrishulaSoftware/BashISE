@@ -24,8 +24,7 @@ It’s built around Trishula’s operational doctrine:
 - **Find** dialog for fast in-buffer search
 - **Project Search** dialog (root-scoped search across files; designed to stay snappy)
 - **Problems panel** for check/run feedback and jump-to style workflows (boot-safe)
-<img width="1334" height="732" alt="Screenshot from 2026-01-15 23-26-45" src="https://github.com/user-attachments/assets/6e03bb95-430f-48dd-aee5<img width="1334" height="732" alt="Screenshot from 2026-01-15 23-26-32" src="https://github.com/user-attachments/assets/1a5cca05-0c27-459c-a2b0-aff423a2576e" />
--e26748faacee" />
+
 
 ### Run + Check
 - **Run buffer** (execute what’s in the editor)
@@ -71,6 +70,9 @@ It’s built around Trishula’s operational doctrine:
   *(Bindings depend on the current canon build.)*
 - **Terminal launcher button** (“Terminal”) to open a shell at the current location
 
+
+<img width="1334" height="732" alt="Screenshot from 2026-01-15 23-26-45" src="https://github.com/user-attachments/assets/6e03bb95-430f-48dd-aee5<img width="1334" height="732" alt="Screenshot from 2026-01-15 23-26-32" src="https://github.com/user-attachments/assets/1a5cca05-0c27-459c-a2b0-aff423a2576e" />
+-e26748faacee" />
 ---
 
 ## Install (No sudo)
@@ -78,6 +80,7 @@ It’s built around Trishula’s operational doctrine:
 ### Option A — Release tarball (recommended)
 1) Download/extract the release tarball  
 2) Run:
+3) 
 
 ```bash
 bash ./<release-folder>/install.sh ./<release-folder>/artifacts/bise2-*.whl
