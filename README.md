@@ -80,7 +80,16 @@ It’s built around Trishula’s operational doctrine:
 ### Option A — Release tarball (recommended)
 1) Download/extract the release tarball  
 2) Run:
-3) 
+
+## Support
+
+If BashISE saves you time, consider supporting the project:
+
+- GitHub Sponsors: https://github.com/sponsors/TrishulaSoftware
+- Ko-fi: https://ko-fi.com/trishulasoftware
+- Buy Me a Coffee: https://buymeacoffee.com/trishulasoftware
+- Open Collective: https://opencollective.com/trishula-software
+- Patreon (monetized later): https://patreon.com/TrishulaSoftware
 
 ```bash
 bash ./<release-folder>/install.sh ./<release-folder>/artifacts/bise2-*.whl
