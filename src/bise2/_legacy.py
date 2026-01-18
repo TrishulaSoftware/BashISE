@@ -1200,7 +1200,7 @@ class Bise2(tk.Tk):
         self.dirty = False
         self.last_exit = ""
         self.recents = load_recents()
-        self.root_dir = os.getcwd()
+        self.root_dir = os.path.expanduser('~')
         self.run_mode = tk.StringVar(value="buffer")  # buffer | saved
         self.args_var = tk.StringVar(value="")
         self.problems = []
@@ -1474,7 +1474,7 @@ class Bise2(tk.Tk):
     def _best_root_dir(self):
         if self.filepath and os.path.exists(self.filepath):
             return os.path.dirname(self.filepath)
-        return os.getcwd()
+        return os.path.expanduser('~')
 
     def set_root_dir(self, root: str):
         root = os.path.abspath(root)
