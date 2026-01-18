@@ -83,6 +83,7 @@ It’s built around Trishula’s operational doctrine:
 
 ## Support
 
+
 If BashISE saves you time, consider supporting the project:
 
 - GitHub Sponsors: https://github.com/sponsors/TrishulaSoftware
