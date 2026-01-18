@@ -94,3 +94,4 @@ If BashISE saves you time, consider supporting the project:
 ```bash
 bash ./<release-folder>/install.sh ./<release-folder>/artifacts/bise2-*.whl
 <img width="1334" height="732" alt="Screenshot from 2026-01-15 23-26-32" src="https://github.com/user-attachments/assets/34db336f-00b8-4498-a382-fe5c7c9394cb" />
+
