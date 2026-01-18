@@ -9,7 +9,7 @@ It’s built around Trishula’s operational doctrine:
 - **Avoid brittle dependencies**
 - **Ship something you can deploy anywhere**
 
----
+----
 
 ## Highlights
 
