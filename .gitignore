@@ -34,3 +34,9 @@ evidence_packs/
 evidence/
 logs/
 *.bak
+
+# Never ship editor/backup artifacts
+*.bak
+*pre_sync.bak*
+*sync.bak*
+*~
