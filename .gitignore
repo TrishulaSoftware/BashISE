@@ -1,0 +1,36 @@
+
+# --- Python packaging/build ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.dylib
+*.dll
+
+build/
+dist/
+*.egg-info/
+*.egg
+*.whl
+*.log
+
+# --- Virtualenv ---
+.venv/
+venv/
+ENV/
+env/
+
+# --- Tools / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Trishula “proof trail” (MUST be local-only; never in repo) ---
+backups/
+receipts/
+evidence_packs/
+evidence/
+logs/
+*.bak
