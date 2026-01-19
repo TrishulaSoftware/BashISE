@@ -11,6 +11,12 @@ It’s built around Trishula’s operational doctrine:
 
 ----
 
+## Releases
+
+- Latest: `v0.1.2` — `https://github.com/TrishulaSoftware/BashISE/releases/tag/v0.1.2`
+- Checksums: see `RELEASES.md`
+
+
 ## Highlights
 
 ### Editor + Workspace
