@@ -40,3 +40,4 @@ logs/
 *pre_sync.bak*
 *sync.bak*
 *~
+.venv-build/
